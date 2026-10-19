@@ -1,0 +1,452 @@
+[
+  {
+    "path": "python/freetoken/engine/engine.py",
+    "symbol": "Engine.forward_batch",
+    "start": 1180,
+    "end": 1200
+  },
+  {
+    "path": "python/freetoken/models/qwen3_moe/moe.py",
+    "symbol": "Qwen3MoeMLP.forward",
+    "start": 24,
+    "end": 33
+  },
+  {
+    "path": "python/freetoken/layers/moe.py",
+    "symbol": "OffloadMoELayer.routed_forward",
+    "start": 203,
+    "end": 224
+  },
+  {
+    "path": "python/freetoken/cli.py",
+    "symbol": "main",
+    "start": 104,
+    "end": 126
+  },
+  {
+    "path": "python/freetoken/cli.py",
+    "symbol": "_run_serve",
+    "start": 27,
+    "end": 31
+  },
+  {
+    "path": "python/freetoken/server/launch.py",
+    "symbol": "launch_server",
+    "start": 125,
+    "end": 224
+  },
+  {
+    "path": "python/freetoken/server/launch.py",
+    "symbol": "_run_scheduler",
+    "start": 58,
+    "end": 122
+  },
+  {
+    "path": "python/freetoken/engine/engine.py",
+    "symbol": "Engine.__init__",
+    "start": 367,
+    "end": 537
+  },
+  {
+    "path": "python/freetoken/moe/expert_banks.py",
+    "symbol": "load_expert_banks",
+    "start": 326,
+    "end": 439
+  },
+  {
+    "path": "python/freetoken/moe/host_banks.py",
+    "symbol": "HostBank.pin",
+    "start": 130,
+    "end": 144
+  },
+  {
+    "path": "python/freetoken/checkpoint/convert.py",
+    "symbol": "convert_checkpoint",
+    "start": 165,
+    "end": 330
+  },
+  {
+    "path": "python/freetoken/checkpoint/ftw.py",
+    "symbol": "FTWReader.read_into",
+    "start": 320,
+    "end": 358
+  },
+  {
+    "path": "python/freetoken/engine/cache_budget.py",
+    "symbol": "layer_slot_bytes",
+    "start": 17,
+    "end": 29
+  },
+  {
+    "path": "python/freetoken/engine/cache_budget.py",
+    "symbol": "plan_cache_budget",
+    "start": 55,
+    "end": 102
+  },
+  {
+    "path": "python/freetoken/engine/engine.py",
+    "symbol": "_adjust_config",
+    "start": 1700,
+    "end": 2021
+  },
+  {
+    "path": "python/freetoken/server/openai_api.py",
+    "symbol": "chat_request_to_genspec",
+    "start": 59,
+    "end": 88
+  },
+  {
+    "path": "python/freetoken/server/generation.py",
+    "symbol": "submit_generation",
+    "start": 297,
+    "end": 314
+  },
+  {
+    "path": "python/freetoken/tokenizer/tokenize.py",
+    "symbol": "TokenizeManager.tokenize",
+    "start": 66,
+    "end": 101
+  },
+  {
+    "path": "python/freetoken/tokenizer/tokenize.py",
+    "symbol": "TokenizeManager._render",
+    "start": 135,
+    "end": 166
+  },
+  {
+    "path": "python/freetoken/core.py",
+    "symbol": "Req",
+    "start": 35,
+    "end": 114
+  },
+  {
+    "path": "python/freetoken/scheduler/prefill.py",
+    "symbol": "PrefillAdder._add_one_req",
+    "start": 135,
+    "end": 230
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler._schedule_next_batch",
+    "start": 863,
+    "end": 873
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler._prepare_batch",
+    "start": 786,
+    "end": 845
+  },
+  {
+    "path": "python/freetoken/models/qwen3_moe/model.py",
+    "symbol": "Qwen3Model.forward",
+    "start": 64,
+    "end": 69
+  },
+  {
+    "path": "python/freetoken/models/qwen3_moe/model.py",
+    "symbol": "Qwen3DecoderLayer.forward",
+    "start": 34,
+    "end": 42
+  },
+  {
+    "path": "python/freetoken/models/qwen3_moe/attention.py",
+    "symbol": "Qwen3MoeAttention.forward",
+    "start": 75,
+    "end": 88
+  },
+  {
+    "path": "python/freetoken/attention/triton.py",
+    "symbol": "TritonAttentionBackend.forward",
+    "start": 118,
+    "end": 202
+  },
+  {
+    "path": "python/freetoken/layers/moe.py",
+    "symbol": "OffloadMoELayer._prefill_routed",
+    "start": 345,
+    "end": 384
+  },
+  {
+    "path": "python/freetoken/layers/moe.py",
+    "symbol": "OffloadMoELayer._wait_prefill_overlap",
+    "start": 386,
+    "end": 396
+  },
+  {
+    "path": "python/freetoken/moe/offload_cache.py",
+    "symbol": "OffloadMoeCache.begin_prefill",
+    "start": 855,
+    "end": 876
+  },
+  {
+    "path": "python/freetoken/moe/offload_cache.py",
+    "symbol": "OffloadMoeCache.prefetch_prefill_layer",
+    "start": 878,
+    "end": 911
+  },
+  {
+    "path": "python/freetoken/moe/offload_cache.py",
+    "symbol": "OffloadMoeCache.release_prefill_layer",
+    "start": 1047,
+    "end": 1064
+  },
+  {
+    "path": "python/freetoken/layers/moe.py",
+    "symbol": "OffloadMoELayer._decode_routed",
+    "start": 260,
+    "end": 295
+  },
+  {
+    "path": "python/freetoken/moe/offload_kernels.py",
+    "symbol": "ensure_experts",
+    "start": 20,
+    "end": 42
+  },
+  {
+    "path": "python/freetoken/moe/offload_cache.py",
+    "symbol": "OffloadMoeCache.copy_missing",
+    "start": 1221,
+    "end": 1269
+  },
+  {
+    "path": "python/freetoken/moe/pool_policy.py",
+    "symbol": "group_layers",
+    "start": 33,
+    "end": 48
+  },
+  {
+    "path": "python/freetoken/moe/pool_policy.py",
+    "symbol": "split_slots",
+    "start": 72,
+    "end": 80
+  },
+  {
+    "path": "python/freetoken/moe/bench_profile.py",
+    "symbol": "fetch_fraction",
+    "start": 116,
+    "end": 128
+  },
+  {
+    "path": "python/freetoken/engine/engine.py",
+    "symbol": "Engine._resolve_hybrid_fetch",
+    "start": 880,
+    "end": 929
+  },
+  {
+    "path": "python/freetoken/moe/offload_kernels.py",
+    "symbol": "_ensure_experts_hybrid_kernel",
+    "start": 271,
+    "end": 417
+  },
+  {
+    "path": "python/freetoken/layers/moe.py",
+    "symbol": "OffloadMoELayer._decode_hybrid",
+    "start": 297,
+    "end": 343
+  },
+  {
+    "path": "python/freetoken/moe/cpu_executor.py",
+    "symbol": "CpuMoeExecutor.decode_submit",
+    "start": 544,
+    "end": 599
+  },
+  {
+    "path": "python/freetoken/moe/cpu_executor.py",
+    "symbol": "CpuMoeExecutor.decode_sync",
+    "start": 601,
+    "end": 621
+  },
+  {
+    "path": "python/freetoken/layers/moe.py",
+    "symbol": "OffloadMoELayer._expert_gemm",
+    "start": 402,
+    "end": 422
+  },
+  {
+    "path": "python/freetoken/layers/quantization/moe/base.py",
+    "symbol": "MoEMethod",
+    "start": 184,
+    "end": 218
+  },
+  {
+    "path": "python/freetoken/layers/quantization/moe/base.py",
+    "symbol": "MoEKernel",
+    "start": 137,
+    "end": 181
+  },
+  {
+    "path": "python/freetoken/layers/quantization/moe/nvfp4.py",
+    "symbol": "MarlinNvfp4MoEKernel.unusable_reason",
+    "start": 280,
+    "end": 290
+  },
+  {
+    "path": "python/freetoken/engine/graph.py",
+    "symbol": "GraphRunner._capture_graphs",
+    "start": 167,
+    "end": 230
+  },
+  {
+    "path": "python/freetoken/engine/graph.py",
+    "symbol": "GraphRunner.pad_batch",
+    "start": 243,
+    "end": 249
+  },
+  {
+    "path": "python/freetoken/engine/graph.py",
+    "symbol": "GraphRunner.replay",
+    "start": 235,
+    "end": 241
+  },
+  {
+    "path": "python/freetoken/scheduler/cache.py",
+    "symbol": "_write_page_table",
+    "start": 625,
+    "end": 650
+  },
+  {
+    "path": "python/freetoken/kvcache/radix_cache.py",
+    "symbol": "RadixPrefixCache.match_prefix",
+    "start": 160,
+    "end": 162
+  },
+  {
+    "path": "python/freetoken/scheduler/cache.py",
+    "symbol": "CacheManager.match_req",
+    "start": 98,
+    "end": 111
+  },
+  {
+    "path": "python/freetoken/kvcache/radix_cache.py",
+    "symbol": "RadixPrefixCache.lock_handle",
+    "start": 141,
+    "end": 158
+  },
+  {
+    "path": "python/freetoken/scheduler/cache.py",
+    "symbol": "CacheManager.snapshot_toolcall_anchor",
+    "start": 153,
+    "end": 178
+  },
+  {
+    "path": "python/freetoken/kvcache/hybrid_radix_cache.py",
+    "symbol": "HybridRadixCache.match_prefix",
+    "start": 76,
+    "end": 88
+  },
+  {
+    "path": "python/freetoken/kvcache/linear_state_pool.py",
+    "symbol": "LinearStatePool.copy_from",
+    "start": 188,
+    "end": 194
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler._restore_linear_states",
+    "start": 616,
+    "end": 626
+  },
+  {
+    "path": "python/freetoken/layers/embedding.py",
+    "symbol": "ParallelLMHead.forward",
+    "start": 127,
+    "end": 152
+  },
+  {
+    "path": "python/freetoken/engine/sample.py",
+    "symbol": "Sampler.prepare",
+    "start": 60,
+    "end": 101
+  },
+  {
+    "path": "python/freetoken/engine/sample.py",
+    "symbol": "Sampler.sample",
+    "start": 103,
+    "end": 125
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler._process_last_data",
+    "start": 312,
+    "end": 429
+  },
+  {
+    "path": "python/freetoken/tokenizer/detokenize.py",
+    "symbol": "DetokenizeManager.detokenize",
+    "start": 93,
+    "end": 147
+  },
+  {
+    "path": "python/freetoken/server/generation.py",
+    "symbol": "generate_events",
+    "start": 542,
+    "end": 569
+  },
+  {
+    "path": "python/freetoken/server/api_server.py",
+    "symbol": "FrontendManager.stream_with_cancellation",
+    "start": 364,
+    "end": 374
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler.overlap_loop",
+    "start": 207,
+    "end": 261
+  },
+  {
+    "path": "python/freetoken/engine/engine.py",
+    "symbol": "Engine.rebuild_runtime_cache",
+    "start": 1028,
+    "end": 1178
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler._execute_pending_rebuild",
+    "start": 661,
+    "end": 731
+  },
+  {
+    "path": "python/freetoken/llm/llm.py",
+    "symbol": "LLM.generate",
+    "start": 100,
+    "end": 125
+  },
+  {
+    "path": "python/freetoken/llm/llm.py",
+    "symbol": "LLM.offline_receive_msg",
+    "start": 53,
+    "end": 87
+  },
+  {
+    "path": "python/freetoken/mm/processor.py",
+    "symbol": "MMProcessor.apply",
+    "start": 112,
+    "end": 146
+  },
+  {
+    "path": "python/freetoken/scheduler/scheduler.py",
+    "symbol": "Scheduler._gather_multimodal",
+    "start": 847,
+    "end": 861
+  },
+  {
+    "path": "python/freetoken/distributed/impl.py",
+    "symbol": "DistributedCommunicator",
+    "start": 63,
+    "end": 70
+  },
+  {
+    "path": "tests/moe/test_offload.py",
+    "symbol": "test_offload_moe_layer_decode_forward_uses_remapped_slot_ids",
+    "start": 333,
+    "end": 383
+  },
+  {
+    "path": "tests/moe/test_hybrid_fetch.py",
+    "symbol": "test_layer_kind_rows_give_fetch_fractions",
+    "start": 15,
+    "end": 41
+  }
+]

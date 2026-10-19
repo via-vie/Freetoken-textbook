@@ -1,0 +1,200 @@
+[
+  {
+    "id": "ch01",
+    "title": "专家为什么需要搬家",
+    "part": "第一部　先把问题看见",
+    "question": "每个 token 只用少数专家，为什么模型还是放不进显存？",
+    "input": "一个已训练好的 MoE checkpoint 和一张 GPU",
+    "process": "区分模型计算、权重放置、请求状态和服务控制",
+    "output": "一张带内存归属的 FreeToken 全局地图"
+  },
+  {
+    "id": "ch02",
+    "title": "亲手算一次 MoE",
+    "part": "第一部　先把问题看见",
+    "question": "CPU 算一部分、GPU 算另一部分，为什么还应该得到同一结果？",
+    "input": "输入 hidden states 与固定教学参数",
+    "process": "计算 router、top-k、门控前馈及加权和",
+    "output": "专家身份、route 权重和一个四维输出"
+  },
+  {
+    "id": "ch03",
+    "title": "从命令进入进程地图",
+    "part": "第一部　先把问题看见",
+    "question": "输入 ft serve 后，到底是谁创建 Scheduler，谁接 HTTP？",
+    "input": "启动命令和 checkpoint 路径",
+    "process": "解析配置、启动后端进程、等待 ready",
+    "output": "能够接收请求的前端与已就绪的执行后端"
+  },
+  {
+    "id": "ch04",
+    "title": "权重怎样装进主存与显存",
+    "part": "第二部　让模型住进机器",
+    "question": "为什么“把权重加载到 CPU”仍不足以启动高效 offload？",
+    "input": "checkpoint、模型配置、量化与设备信息",
+    "process": "构建模型骨架并装载匹配 kernel 的权重布局",
+    "output": "GPU 常驻主干、host experts 和可复制的 GPU banks"
+  },
+  {
+    "id": "ch05",
+    "title": "给显存做一份预算",
+    "part": "第二部　让模型住进机器",
+    "question": "专家缓存越大越好吗？A100 的显存为什么不能全给 experts？",
+    "input": "已知权重布局、设备基线空闲量和容量参数",
+    "process": "为专家、KV、固定状态与运行时余量结账",
+    "output": "合法的 slots、pages 和 prefill overlap 配置"
+  },
+  {
+    "id": "ch06",
+    "title": "从提示词到 UserMsg",
+    "part": "第三部　跟着一个请求走",
+    "question": "用户写的“小猫喜欢吃”是怎样变成模型输入的？",
+    "input": "HTTP messages、生成设置和 uid",
+    "process": "协议归一化、应用聊天模板、tokenize",
+    "output": "UserMsg：CPU ids、采样参数及必要的附加数据"
+  },
+  {
+    "id": "ch07",
+    "title": "调度器的三种长度",
+    "part": "第三部　跟着一个请求走",
+    "question": "刚生成了“鱼”，为什么它还没有自己的 KV？",
+    "input": "UserMsg 和当前空闲表/页/状态槽",
+    "process": "接纳、匹配前缀、组成 Batch 并维护长度",
+    "output": "本轮要计算的区间与下一轮可继续的 Req"
+  },
+  {
+    "id": "ch08",
+    "title": "模型主干与 Attention",
+    "part": "第三部　跟着一个请求走",
+    "question": "同一串 ids 如何通过每一层，又把新 K/V 写到哪里？",
+    "input": "Batch.input_ids、positions、out_loc 与 attention metadata",
+    "process": "Embedding、归一化、Attention、残差和前馈",
+    "output": "与输入行对应的 hidden states，以及新增请求状态"
+  },
+  {
+    "id": "ch09",
+    "title": "Prefill 的整层双缓冲",
+    "part": "第四部　专家如何执行",
+    "question": "明明路由只选 top-k，prefill 为什么往往要提前搬整层专家？",
+    "input": "一段 prompt 的 hidden states、专家 host banks",
+    "process": "按层预取、等待就绪、GPU 专家计算、释放缓冲",
+    "output": "计算完当前层的 hidden states 与可复用的暂存区"
+  },
+  {
+    "id": "ch10",
+    "title": "Decode 的专家缓存",
+    "part": "第四部　专家如何执行",
+    "question": "router 给的是专家 3，GPU kernel 为什么最后会读 slot 1？",
+    "input": "本层 topk_ids、GPU 驻留映射与 host banks",
+    "process": "查命中、去重、选择受害槽、复制并改写索引",
+    "output": "可直接由专家 kernel 读取的 slot ids 与完整权重"
+  },
+  {
+    "id": "ch11",
+    "title": "搬几个，算几个",
+    "part": "第四部　专家如何执行",
+    "question": "CPU 比 PCIe 快，并不意味着所有缺失都应该留在 CPU：怎样算分工？",
+    "input": "唯一缺失专家数 m、专家大小和有效带宽",
+    "process": "建立并发关键路径模型，再映射到源码策略",
+    "output": "本步 fill 数 q 与 GPU/CPU route 分区"
+  },
+  {
+    "id": "ch12",
+    "title": "CPU 与 GPU 同时开工",
+    "part": "第四部　专家如何执行",
+    "question": "CPU 只算少数 route 时，需要把整套模型来回搬吗？",
+    "input": "hidden_states、原始路由权重和分区计划",
+    "process": "CPU 读 host experts，GPU 读 slots，按协议同步并合并",
+    "output": "与原 MoE 语义相同的部分和总输出"
+  },
+  {
+    "id": "ch13",
+    "title": "量化布局与算子选择",
+    "part": "第四部　专家如何执行",
+    "question": "同样叫 4-bit 权重，为什么有的路径在 A100 上不能直接运行？",
+    "input": "模型量化说明、各层 geometry 与设备能力",
+    "process": "选择 method/kernel、定义 bank schema、打包并执行",
+    "output": "符合具体 kernel 契约的 ExpertView 与专家结果"
+  },
+  {
+    "id": "ch14",
+    "title": "动态路由与 CUDA Graph",
+    "part": "第五部　让执行稳定又连续",
+    "question": "每轮专家都在变，图回放为什么不会一直计算第一次的路由？",
+    "input": "模型、稳定缓冲、支持的 batch sizes 和执行协议",
+    "process": "预热、捕获、写入本步数据、回放",
+    "output": "较少 CPU 发起开销的 decode logits"
+  },
+  {
+    "id": "ch15",
+    "title": "KV 分页与前缀复用",
+    "part": "第五部　让执行稳定又连续",
+    "question": "请求结束后，为什么还有 KV 占显存？这算泄漏吗？",
+    "input": "精确 token 前缀、请求表和 KV 资源",
+    "process": "匹配缓存、分配页面、锁定引用、写入及回收",
+    "output": "可由 attention 读取的历史状态与可复用前缀"
+  },
+  {
+    "id": "ch16",
+    "title": "递归状态与边界锚点",
+    "part": "第五部　让执行稳定又连续",
+    "question": "只改了工具调用后的一段文本，为什么不能继续用旧的最终状态？",
+    "input": "精确匹配前缀与混合模型的状态快照",
+    "process": "选择可恢复边界、复制到活跃槽、重算后缀",
+    "output": "与新前缀一致的递归状态及 KV"
+  },
+  {
+    "id": "ch17",
+    "title": "采样、返回与取消",
+    "part": "第六部　把完整服务接起来",
+    "question": "EOS 已经生成了，为什么还有几处函数必须继续处理？",
+    "input": "当前批 logits 与每条请求的生成设置",
+    "process": "选 next id、提交结果、判断终止、生成文本增量并清理",
+    "output": "用户收到内容，活动请求资源按顺序释放"
+  },
+  {
+    "id": "ch18",
+    "title": "运行时调整容量",
+    "part": "第六部　把完整服务接起来",
+    "question": "为什么调一个显存滑块，不能只给 Python 字段赋一个新值？",
+    "input": "新容量请求、当前池 geometry 与在途工作",
+    "process": "等待安全点、校验预算、重建并重新捕获必要图",
+    "output": "新的可服务容量，或明确的拒绝/失败回复"
+  },
+  {
+    "id": "ch19",
+    "title": "把扩展分支接回主线",
+    "part": "第六部　把完整服务接起来",
+    "question": "换成离线生成、图像输入或多卡，前面的架构还成立吗？",
+    "input": "单卡文本主线与不同入口/模型需求",
+    "process": "识别复用的调度计算骨架及新增边界",
+    "output": "能定位扩展代码且不误套主线假设的架构图"
+  },
+  {
+    "id": "ch20",
+    "title": "实验指南：先算清，再上 A100",
+    "part": "第七部　动手与复盘",
+    "question": "今天打开终端，具体先做什么、留下什么证据才算学会？",
+    "input": "本教材、Python，以及可选的 Linux A100 服务器",
+    "process": "依次运行教学实验、核对源码、建立实机基线和单变量对照",
+    "output": "数值记录、资源状态表与有条件可复现的测量结果"
+  },
+  {
+    "id": "ch21",
+    "title": "把一次生成完整复述出来",
+    "part": "第七部　动手与复盘",
+    "question": "不看目录，能沿着“小猫喜欢吃 → 鱼 → EOS”讲完全部架构吗？",
+    "input": "各章的局部输入输出与资源账本",
+    "process": "合并主线、区分时序、审查常见错误",
+    "output": "一份可用于讲解或排错的端到端模型"
+  },
+  {
+    "id": "ch22",
+    "title": "源码路线与术语索引",
+    "part": "第七部　动手与复盘",
+    "question": "怎样从“读过教材”走到自己能定位问题和验证判断？",
+    "input": "全书架构与教学实验结果",
+    "process": "按问题组织精读路线，核对来源与实现边界",
+    "output": "可重复使用的源码阅读与验证清单"
+  }
+]

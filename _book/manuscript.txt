@@ -1,0 +1,575 @@
+@chapter 01|第一部　先把问题看见|专家为什么需要搬家|每个 token 只用少数专家，为什么模型还是放不进显存？
+@handoff 一个已训练好的 MoE checkpoint 和一张 GPU|区分模型计算、权重放置、请求状态和服务控制|一张带内存归属的 FreeToken 全局地图
+## 1.1 从一次真实困惑开始
+假设模型共有 100 GiB 参数，但当前 GPU 只能给权重留下 20 GiB。我们听说 MoE 每步只激活少数专家，于是产生一个直觉：既然只用一小部分，直接加载这一小部分不就可以了吗？问题在于，**这一层会选哪些专家，要等前一层算出 hidden states、再经过 router 才知道**。下一步、下一请求还可能换一批。没有被当前 token 用到的专家，也不能永远丢掉。
+FreeToken 要解决的就是这类运行时问题。它读取已经训练好的权重，把较大的专家集合保存在主存，根据执行阶段把需要的权重送到 GPU，或者直接让 CPU 计算部分专家。这里“free”不意味着数学运算或内存访问没有成本；学习这套引擎，关键是看清成本被放在哪里、何时发生、如何与其他工作重叠。
+本书以官方 FlashML-org/FreeToken 的固定提交为准。它也有稠密模型、不同注意力、量化、多模态和多卡支持。为了先抓住主干，我们以**单卡、文本、MoE、普通因果注意力**讲完整请求，随后再把扩展分支接回地图。没有要求你先装好上百 GiB 权重。
+## 1.2 先分清四本账
+|账本|里面是什么|何时改变|主要归属|
+|模型参数|Embedding、Attention、router、专家矩阵、LM head|本书的推理过程中不进行梯度更新|checkpoint、host banks、GPU 常驻权重|
+|专家驻留|哪个逻辑专家在 GPU 哪个 slot|缺失填充、驱逐、prefill 暂存、容量重建|OffloadMoeCache|
+|请求状态|过去的 KV、递归状态、token 序列、停止条件|每次前向及结果提交|KV/状态池、Req、prefix cache|
+|控制状态|等待队列、运行队列、在途 batch、回复通道|接收、调度、返回、取消|前端与 Scheduler|
+同一请求结束时，参数仍然存在，部分专家副本仍可能驻留，一些前缀 KV 仍可能可复用，但请求的活动引用必须释放。把这四种寿命混在一起，是读缓存源码时最常见的障碍。
+@figure architecture
+## 1.3 沿箭头走一遍
+用户发来 messages。前端验证参数，Tokenizer 把对话模板变成 ids。Scheduler 匹配可复用前缀、决定本次处理哪些 token，并分配写入位置。Engine 运行模型，每层先做注意力，再进入专家前馈。专家模块决定使用 GPU 中已有的权重、搬入缺失权重，或交给 CPU。最后 hidden states 经 LM head 产生 logits，Sampler 选 next id，结果提交后变成增量文本。
+先记住这条链，后面每章只拆其中一段。先不要背目录里的所有文件。打开下面的短函数，看到它如何接收一个已经准备好的 batch，就已经找到了模型执行的总入口。
+@source engine/engine.py|Engine.forward_batch|输入 Batch 和 BatchSamplingArgs，输出 GPU/CPU 上的 next token 及复制完成事件。注意前向、采样和结果提交不是同一个函数。
+## 1.4 怎样使用这本书
+每章开头的交接栏告诉你前一章交来了什么，末尾练习要求你自己预测下一状态。绿色源码卡默认折叠：先在脑中完成例子，再打开真实函数核对。SVG 可以单独打开放大；源码页面保留固定行号；CPU 实验只使用 Python 标准库。
+@note 本书的证据边界|手算尺寸、token ids、带宽、毫秒数均为明确标注的教学设定。没有在本机运行真实 FreeToken 模型或 A100 基准测试；上游文档中的支持情况也不能替代你自己服务器上的实测。
+@check 如果增加 GPU 专家 slots，能保证每条请求的 KV 容量也增加吗？|不能。二者竞争显存。专家 miss 可能减少，但留给 KV、状态与运行时的容量可能减少。必须联合结账。
+@check 推理引擎会在每次回答时重新训练 router 吗？|普通推理不会。router 的参数来自 checkpoint；每次计算新的路由结果，改变的是本步选中专家与缓存驻留状态。
+@next 下一章先拿一行四维向量，真的算出专家选择和加权输出。理解这个不变的数学目标，后面才能判断搬运优化有没有算错。
+
+@chapter 02|第一部　先把问题看见|亲手算一次 MoE|CPU 算一部分、GPU 算另一部分，为什么还应该得到同一结果？
+@handoff 输入 hidden states 与固定教学参数|计算 router、top-k、门控前馈及加权和|专家身份、route 权重和一个四维输出
+## 2.1 把模型缩小到能检查
+这里取 N=1、D=4、E=8、top-k=2、FFN 中间维度 F=6。输入 x=[1,0,−1,2]。E 指每层可选专家数，不是所有层的专家总数。一个 route 是“一个 token 选择某个专家并带一个权重”；两个 token 都选择专家 3，就有两条 route，却只有一个需要搬运的唯一专家。
+教学 router 矩阵 R 为 4×8。我们按行向量约定计算 z=xR，得到 [0.300,0.500,−0.300,1.100,−0.500,0.100,−0.300,0.600]。例如第 3 号专家（从 0 编号）的 logit 为 1×0.4+0×0−1×(−0.1)+2×0.3=1.1。
+softmax 先把 logits 转为 8 个概率；选择最大的两个，对应专家 3、7。我们规定选中后再归一化，因此权重分别为 0.622459… 与 0.377541…。这等价于在这两个选中 logits 上做 softmax。本例选择这一规则是为了算清楚；真实模型还可能有 sigmoid、分组选择、bias、缩放或共享专家，必须看具体 router。
+## 2.2 专家内部没有魔法
+每个专家都有 Wg、Wu、Wd。按本书的行向量记法，Wg 和 Wu 是 4×6，Wd 是 6×4。先求 g=xWg、u=xWu，再求 a=SiLU(g)⊙u，最后求 ye=aWd。SiLU(t)=t/(1+exp(−t))，⊙ 表示对应元素相乘。
+为了让你复算任意元素，所有权重都有定义。下列 i、j、e 都从 0 编号；脚本生成完整矩阵，不依赖随机种子。
+~~~
+Wg[e,i,j] = (e+1)*(i+1)*(j+1)/100
+Wu[e,i,j] = (i-j+e+1)/20
+Wd[e,i,j] = (j+1)*(i+1)/(50*(e+1))
+~~~
+专家 3 的 g=[0.240,0.480,0.720,0.960,1.200,1.440]，u=[0.600,0.500,0.400,0.300,0.200,0.100]。它的第一个中间元素是 SiLU(0.24)×0.6≈0.081。六个中间元素乘 Wd 后得到 y3≈[0.017,0.034,0.051,0.068]。专家 7 得到 y7≈[0.060,0.119,0.179,0.238]。
+最终 y=0.622459…×y3+0.377541…×y7≈[0.033,0.066,0.099,0.132]。显示时保留约三位小数，后续计算始终使用完整浮点值。真实 PyTorch 权重常以输出维在前保存，kernel 还会转置或打包；矩阵物理布局不能直接套用本段的教学方向。
+@figure math
+@lab moe
+## 2.3 放置策略不能改变路由含义
+若 GPU 计算专家 3、CPU 计算专家 7，只要两边保留相同的路由权重，分别得到部分和，再相加即可。计算顺序和精度可能带来舍入差异；但不能为了加速省掉 CPU 那条 route，或让两边重复加一次。
+@source models/qwen3_moe/moe.py|Qwen3MoeMLP.forward|逐行追踪 hidden_states → gate.forward → experts.forward → reshape。这里 gate 是 router，与每个专家内部的 gate 投影不同。
+@source layers/moe.py|OffloadMoELayer.routed_forward|部分模型在外部计算路由，再传 topk_weights/topk_ids。阅读关于 ids 可被原地改写、hidden_states 可能被覆盖的约定。
+@check 两个 token 都选中专家 3，miss 应该计几次？|权重搬运按唯一缺失专家计一次；实际专家计算仍有两行输入，分别带各自 route 权重。
+@check 为什么不能在原地改写 topk_ids 之后直接把它当 CPU 专家编号？|它可能已经是 GPU slot 编号。CPU 必须取得原始 expert id 或专门生成的 cpu_ids，否则会读错权重。
+@next 我们已经有了不能改变的数学目标。现在从 ft serve 找到哪些进程负责把请求送到这个计算入口。
+
+@chapter 03|第一部　先把问题看见|从命令进入进程地图|输入 ft serve 后，到底是谁创建 Scheduler，谁接 HTTP？
+@handoff 启动命令和 checkpoint 路径|解析配置、启动后端进程、等待 ready|能够接收请求的前端与已就绪的执行后端
+## 3.1 不要从名字猜入口
+pyproject.toml 声明 `ft = freetoken.cli:main`。cli.main 根据第一段命令选择 runner；serve 进入 _run_serve，再调用 server.launch.launch_server。注意根目录的 freetoken/launch.py 主要负责配置并启动外部 agent；**服务进程启动应先读 server/launch.py**。把两个 launch 看成一回事，会一开始就走错调用链。
+@source cli.py|main|输入 argv，选择命令表中的 runner，返回退出码。本章只沿 serve 分支读。
+@source cli.py|_run_serve|这个短函数把 argv 交给服务启动器，没有在这里构建模型。
+## 3.2 把进程和对象分开画
+launch_server 先 parse_args，必要时解析 GPU 标识，再构造 start_subprocess 回调交给 run_api_server。回调使用 spawn，为每个 TP rank 启动 Scheduler 进程，另启动 detokenizer 和配置数量的 tokenizer workers。默认参数还会影响 tokenizer 链接方式，不能把图中的一个功能框机械地理解为永远只有一个固定进程。
+单 A100 对应 TP size=1，模型执行后端只有一个 rank。FrontendManager 在 API 服务侧负责 uid、消息发送与结果队列；Scheduler 进程里包含 Scheduler 对象和 Engine 对象，后者绑定 GPU、加载模型、建立缓存与图。**一个 Engine 对象不等于一个单独的 Engine 进程**。
+|边界|传递的东西|这一步不应混淆的状态|
+|HTTP → 前端|JSON、连接、采样设置|网络生命周期与 GPU 生命周期不同|
+|前端 → tokenizer|TokenizeMsg、uid、模板参数|原始 messages 还不是模型 ids|
+|tokenizer → scheduler|UserMsg，含 ids 与采样参数|uid 用于把结果送回原请求|
+|scheduler → detokenizer → 前端|next_token、finished、错误/统计|模型 token 与文本 delta 不同|
+@source server/launch.py|launch_server|先看参数解析，再看 start_subprocess 中 mp.Process 的 target、name、args，最后看 run_api_server 接收回调。
+@source server/launch.py|_run_scheduler|输入 ServerArgs 与 ready 队列，创建 Scheduler，成功初始化后发 ready，再进入 run_forever。
+## 3.3 为什么 ready 必须晚于权重加载
+端口能打开，不表示模型已经可执行。模型初始化还包括 checkpoint 读取、host bank 分配、CPU executor 建立、KV 容量计算和图捕获。上游把后端就绪确认送回 supervisor，让前端能够区分 loading、ready 和后端死亡。初学时不要用“curl 有响应”代替“后端 ready”。
+本书源码页面来自固定提交 e4f69d9e232448fc168389c29f6f9364869cff35，而非移动中的 main。以后对照新版本时，先比较版本和 commit，再讨论函数行号变化。
+@check TP=1 时，Tokenizer 和 Scheduler 一定运行在同一 Python 调用栈吗？|在线 serve 路径有进程和消息边界。离线 LLM 路径可复用调度逻辑但使用不同 I/O；不要把两种入口混写成一条栈。
+@next 现在我们找到了创建 Engine 的位置。下一步暂停接收请求，先看参数怎样从磁盘变成可供专家计算的 banks。
+
+@chapter 04|第二部　让模型住进机器|权重怎样装进主存与显存|为什么“把权重加载到 CPU”仍不足以启动高效 offload？
+@handoff checkpoint、模型配置、量化与设备信息|构建模型骨架并装载匹配 kernel 的权重布局|GPU 常驻主干、host experts 和可复制的 GPU banks
+## 4.1 模型结构先于数据填充
+Engine 初始化会绑定设备、调整配置，并根据注册的架构构建模型。构建结构时必须知道 hidden size、层数、专家数、注意力类型和量化方案，这决定每个参数或 bank 的形状。meta-device 构造可以帮助查询布局而不真正分配整套数据；不能把它当作模型已经在 GPU 中加载完毕。
+接下来需要把非专家权重与专家权重区分。前者通常在 GPU 常驻，后者在 offload 路径形成 host banks。bank 是按统一 schema 管理的一类张量集合；同一专家可能同时需要 gate_up、down、scale 等多个 bank 的对应行。拷贝了 packed weight 却忘记 scale，得到的不是正确专家。
+@figure loading
+@source engine/engine.py|Engine.__init__|函数较长，按设备与 Context、模型与权重、专家缓存、KV/状态池、预热与 GraphRunner 的阶段阅读。实际分配顺序以固定源码为准。
+@source moe/expert_banks.py|load_expert_banks|关注输入方法/布局、来源检查、FTW 分支及结果 ExpertBanks；不要只读到某一个 torch.load 就结束。
+## 4.2 物理布局是执行契约
+假设教学专家有 4×6、4×6、6×4 三个矩阵。在普通浮点教学中我们分别保存；实际引擎可能把 gate 与 up 拼成一个 bank，也可能按量化分组打包、转置、交错存储。CPU executor 与 GPU kernel 必须各自知道该布局。当前版本还可处理不同层有不同专家格式的模型，因此布局检查、按 layout 分 pool 都是正确性所需。
+一份逻辑专家权重的源数据与一份 GPU 副本要能对应起来：源指针确定哪一层哪一专家，目标 slot 确定写往 GPU 的哪一行，schema 确定该行包含哪些数据。后面的缓存索引只是在这份契约之上选择行。
+## 4.3 pinned memory 解决什么
+异步跨设备传输需要稳定、可供设备访问的主存地址。pin/lock 也有系统成本和上限：大量内存被固定后，其他任务能灵活使用的主存会减少。上游 HostBank 管理分配与 residency，装载流程可在数据到位后 pin，并支持流水处理；具体默认和回退要看硬件、格式与配置。
+因此“主存足够大”和“能把所有专家以所需方式 pin 好”是两个检查。PinFailed 也不应一律解释为 GPU OOM。CPU decode、未 pin 层和 pageable 整层 prefill 有专门约束，不是任意把 non_blocking=True 改为 False 就等价。
+@source moe/host_banks.py|HostBank.pin|查看注册、失败处理与 residency 更新。这里解决的是主存页和设备访问属性，不是 KV 页面分配。
+## 4.4 FTW 是装载格式，不是学习算法
+HF checkpoint 可能需要运行时重新组织专家参数。FTW 将 FreeToken 运行时需要的数据和元信息保存到便于读取的文件结构中，减少重复装载处理。FTWReader.read_into 的目标是把指定条目读到目标缓冲，而非训练新权重。
+若 layout 或 kernel 选择变化，旧 FTW 的 packing 可能与当前方法不匹配。应读错误并重新确认转换配置。不要把“格式转换”与“模型一定变成某种量化精度”混为一谈；是否转换量化由具体转换选项和输入格式决定。
+@source checkpoint/convert.py|convert_checkpoint|读取输入、输出、方法选择与已有结果校验，确认转换产物及元信息从何而来。
+@source checkpoint/ftw.py|FTWReader.read_into|输入条目与目标缓冲，处理分片和读取；输出是填充后的数据，而不是模型预测。
+@check 一个 slot 的 gate_up 已复制、down 尚未复制，可以开始完整专家计算吗？|不可以。专家计算依赖 schema 中完整的张量集合和对应 scale；执行必须排在必要复制之后。
+@next 权重已找到落脚点，但每种池能分到多大还没决定。下一章用字节账本理解启动时的资源规划。
+
+@chapter 05|第二部　让模型住进机器|给显存做一份预算|专家缓存越大越好吗？A100 的显存为什么不能全给 experts？
+@handoff 已知权重布局、设备基线空闲量和容量参数|为专家、KV、固定状态与运行时余量结账|合法的 slots、pages 和 prefill overlap 配置
+## 5.1 先估算一个专家有多大
+本书教学 SwiGLU 专家参数数为 DF+DF+FD=3DF。D=4、F=6 时只有 72 个数，BF16 占 144 字节。真实模型代入 D、F 后会很大；有 bias、scale、padding、TP 切片或不同格式时，必须按各 bank 的真实 numel×element_size 求和。源码 layer_slot_bytes 就按每层各 bank 的一行计字节，部分固定驻留 scale 另计。
+普通全注意力的 KV 大致随 token 数线性增长。每个 token 的 K/V 字节数可从层数、KV head 数、head dimension 和 dtype 推出，但混合注意力、MLA、SWA、状态池不能统一套一个公式。引擎先识别 pool family，再用该类的成本模型。
+## 5.2 教学预算与源码预算分别读
+教学账本假设总量 40 GiB，常驻主干 8、运行时 3、余量 2、KV 7，剩余 20 GiB。若一个专家 slot 为 0.125 GiB，则能放 160 个。这只是演示减法，**不是对 A100 40G 或 80G 实机可用容量的承诺**。
+@lab budget
+真实共享策略以 net_cache_budget_bytes 为起点：对启动前基线空闲量应用 memory_ratio，再减常驻权重与固定缓存。plan_cache_budget 先预留 KV 页面，专家按范围尽量填充预算，KV 再接收剩余量；它还考虑两整层暂存要求、kernel 最大槽数与总专家数上限，并在最小合法配置超预算时提前拒绝。
+@figure memory
+@source engine/cache_budget.py|layer_slot_bytes|按 bank 行实际字节相加，注意固定 scale 不属于每增加一个 slot 的增长项。
+@source engine/cache_budget.py|plan_cache_budget|逐行记下 budget、lo、hi、kv_reserve_bytes、raw、remaining。输出是三元组，不只一个 cache size。
+## 5.3 一个直接的取舍
+假设请求变长，预留 KV 从 7 GiB 提到 11 GiB，其余不变，专家预算从 20 降到 16 GiB，按同一教学 slot 可放 128 个。专家 miss 率可能升高，但更长上下文得以容纳。反之，强行保持 160 slots 可能让队列无法被接纳。
+双缓冲需要容得下两层专家的暂存视图；CPU MoE 策略的 GPU 预留也不能简单理解为零专家空间。初始化配置会根据策略调整。auto 是一个规则集合，最终日志里的 Resolved config 比你只看命令行中写的 auto 更接近真实执行。
+## 5.4 四种专家执行策略放在一起
+|策略|专家主要保存在哪里|Prefill 的主路径|Decode 的主路径|
+|fused|全部专家 GPU 常驻|GPU 专家计算|GPU 专家计算，无 offload slot 调度|
+|offload|完整 host banks + GPU 部分副本|整层暂存到 GPU，可双缓冲|缺失专家搬入，选中专家都在 GPU 计算|
+|cpu|完整 host banks + GPU prefill 缓冲|整层暂存，保留两层缓冲|CPU 执行专家；模型其他 GPU 主干仍照常运行|
+|hybrid|完整 host banks + GPU 专家缓存|沿 offload 家族的 prefill 路径|GPU 算命中与选定 fill，CPU 算其余 miss|
+这是专家层的策略表，不代表把整条 Transformer 全放在表中某个设备。`--moe-cpu-layers` 还能对 offload/hybrid 指定某些层的 decode 由 CPU 执行；它与“每层内部同时分 GPU/CPU 的 hybrid”是不同维度。普通独立显存 MoE 的 auto 在本提交默认 offload；统一内存设备等存在另行判定。dense 模型没有 routed experts，会清理无效 MoE 配置。后面讲某条路径时，都先确认自己落在哪一行。
+@source engine/engine.py|_adjust_config|找到 dense、auto、fused、cpu、hybrid 的分支。特别观察 cpu 策略仍保留 prefill 两层缓冲，和 fused 策略忽略 offload cache sizing 的处理。
+@check memory_ratio=0.9 是否等于“精确使用显卡标称容量的 90%”？|不是。这里以特定时刻的基线空闲量等测量为依据，且常驻分配、图、工作区及外部进程仍会影响运行。应核对预算代码和实际日志。
+@next 机器资源准备好以后，才轮到第一条用户输入。下一章把 messages、文本、ids 和 uid 一一对应起来。
+
+@chapter 06|第三部　跟着一个请求走|从提示词到 UserMsg|用户写的“小猫喜欢吃”是怎样变成模型输入的？
+@handoff HTTP messages、生成设置和 uid|协议归一化、应用聊天模板、tokenize|UserMsg：CPU ids、采样参数及必要的附加数据
+## 6.1 定好贯穿全书的请求
+我们用提示文本“小猫喜欢吃”，期望说明一次先生成“鱼”、再停止的流程。为了延续前面图解的记号，教学 ids 定为 [11,10,7]，鱼=8，EOS=1。**这些编号是自定义追踪标签，并非 Qwen 或 FreeToken 自带词表**。真实聊天模板通常还插入角色与边界 token，真实模型也不保证选择这两个输出。
+本书不会声称四维教学 MoE 算出了真实中文回答。四维矩阵用来解释专家数学；这串 ids 用来解释调度和状态。二者分工明确，随后会在同一层的执行顺序上接起来。
+## 6.2 messages 不是简单字符串拼接
+HTTP 处理器把协议请求变成共享生成描述，解析 max_tokens、temperature 等设置，并发送 TokenizeMsg。TokenizeManager.render_prompt 处理 messages 列表、模板参数、tools 或特定编码器，_render 调用 checkpoint tokenizer 的 apply_chat_template，通常还添加 assistant 开始生成的提示。
+TokenizeManager.tokenize 随后 encode，并把结果展平为 CPU int32 ids。模板已经负责 special tokens 时，它避免 encode 再自动加一遍特殊符号。这是一个很具体的错误来源：多加 BOS 不仅改变长度，也改变模型输入、前缀匹配和所有后续位置。
+@source server/openai_api.py|chat_request_to_genspec|先看协议字段怎样进入共享生成描述，注意“模型名”不等于 prompt 中的一部分文本。
+@source server/generation.py|submit_generation|核对 uid、采样设置、模板与消息提交如何交给前端；这一步还没有运行 Transformer。
+@source tokenizer/tokenize.py|TokenizeManager.tokenize|追踪 prompt → encode → view(-1) → int32 → UserMsg。图像分支留到第 19 章。
+@source tokenizer/tokenize.py|TokenizeManager._render|看模板参数和 add_generation_prompt，不要手工猜测某个模型所有 special tokens 的编号。
+## 6.3 进入后端前的最小记录
+|字段|教学请求取值|意义|
+|uid|例如 42|跨进程相关联的请求身份；不是 token id|
+|input_ids|[11,10,7]|已知的提示 token，CPU tensor|
+|sampling_params|max_tokens=2，temperature=0|输出预算及选择规则|
+|模板与模型|由 checkpoint 决定|决定真正的分词、EOS 和上下文语义|
+一旦 UserMsg 发出，调度器处理的是 ids 和资源状态，通常不需要再在每层看到原始汉字。“用户输入给模型”具体意味着：模型读取 token ids，Embedding 查表得到向量，而不是直接把 UTF-8 字节送给矩阵乘法。
+@check 修改提示词里的一个空格，会不会影响 prefix cache 命中？|可能。模板与 tokenizer 可能产生不同的 ids，缓存匹配依据精确 token 前缀，不能仅按肉眼觉得语义相同判断。
+@next 下一步需要把 UserMsg 变成可执行 Req。这里最容易混淆的是“已经知道的 token”和“已经计算出状态的 token”。
+
+@chapter 07|第三部　跟着一个请求走|调度器的三种长度|刚生成了“鱼”，为什么它还没有自己的 KV？
+@handoff UserMsg 和当前空闲表/页/状态槽|接纳、匹配前缀、组成 Batch 并维护长度|本轮要计算的区间与下一轮可继续的 Req
+## 7.1 先在纸上运行普通循环
+暂时关闭重叠的复杂性，只看因果关系。输入 ids 有 3 个，尚无计算状态，因此已知=3、已计算=0。prefill 处理位置 0、1、2，在最后位置的 logits 里选出 8。此时已知=4，**已计算仍为 3**；id 8 是前一位置预测出来的，尚未作为输入经过各层。
+下一轮 decode 输入 8、位置 3，写该位置的 KV，预测 1。此时已知=5、已计算=4。若 1 是停止符，逻辑上不需要再计算它的状态。本书的轨迹实验正是这个串行教学账本；真实 overlap 路径可能提前排入额外一步，提交侧会丢弃已经结束请求的多余结果。
+@figure request
+@lab request
+## 7.2 对照真实 Req 字段
+Req.input_ids 是 CPU 已保存的 ids。device_len 表示设备侧调度长度，cached_len 表示当前进度；extend_len=device_len−cached_len 给出本次尚待处理的长度。max_device_len 由初始输入和输出预算共同决定，remain_len 用来判断是否还有输出空间。它们不是五个同义词。
+Req.complete_one 把 cached_len 设为当前 device_len，随后让 device_len 增 1，为下一 token 准备位置。这个方法在 Engine.forward_batch 里调用，时间上可以早于 CPU 收到采样结果。Req.append_host 才把 next token 真正追加到 CPU ids。因此在 overlap 中，`len(input_ids)` 不必时时等于 device_len。
+@source core.py|Req|先画出 __post_init__ 的初始关系，再单独跟踪 complete_one、append_host 和 can_decode。不要看到名字里有 cached 就假设它与 CPU 已确认结果同步。
+## 7.3 本版本如何选下一批
+Scheduler._schedule_next_batch 先尝试 PrefillManager，再尝试 DecodeManager。这是本提交的具体策略；源码还留有支持其他策略的 TODO。不要直接套用其他推理引擎“decode 优先”或“同一 batch 混合所有阶段”的描述。
+prefill 的 token 预算、请求表、KV 和状态池共同限制接纳；长 prompt 可被分成多个 chunk。中间 chunk 还未走到完整 prompt 末尾，因此不能把每个 chunk 的最后一行都当作对用户输出一个新词。ChunkedReq 和结果处理中的分支负责这层区别。
+@source scheduler/prefill.py|PrefillAdder._add_one_req|看命中长度、资源校验和切块条件，记录不能加入时的原因。返回失败不等于请求永久失败。
+@source scheduler/scheduler.py|Scheduler._schedule_next_batch|本版本 prefill-first 的直接依据。沿返回值继续进入 _prepare_batch。
+@source scheduler/scheduler.py|Scheduler._prepare_batch|输入含请求的 Batch，输出 ForwardInput：页分配、positions、输入/输出索引、attention metadata 和 sample_args。
+## 7.4 最小的验收方式
+画四列：CPU ids、cached_len、device_len、在途 batch。每次只移动一个函数调用：prepare → forward → complete_one → copy_done → append_host。若你能指出哪一步 CPU 还不知道新 id，就真正理解了调度状态，之后看竞态修复会容易很多。
+@check input_ids 已有 4 个、cached_len=3，在普通无重叠例子里这一轮要处理多少 token？|1 个，即位置 3 的 id 8。用 extend_len 的定义核对设备长度；真实 overlap 还要看该 batch 的准备时刻。
+@check 当前提交会无条件把新 prefill 和运行中 decode 拼成一个 mixed batch 吗？|不能这样概括。_schedule_next_batch 选 prefill batch 或 decode batch；chunked prefill 和调度重叠不自动等于 mixed-phase batching。
+@next 请求已被组织成输入行、位置和写入地址。下一章进入模型主干，逐层确认这些行怎样变成注意力结果。
+
+@chapter 08|第三部　跟着一个请求走|模型主干与 Attention|同一串 ids 如何通过每一层，又把新 K/V 写到哪里？
+@handoff Batch.input_ids、positions、out_loc 与 attention metadata|Embedding、归一化、Attention、残差和前馈|与输入行对应的 hidden states，以及新增请求状态
+## 8.1 从三行 ids 到三行向量
+统一请求 prefill 有 N=3。教学 D=4 时，Embedding 输出 H 为 3×4，每一行对应一个输入位置。真实 Qwen3 MoE 主干在 Qwen3Model.forward 中初始化 residual，再逐层传递 x 与 residual，最后做 norm。残差融合实现把“相加”和“归一化”放进高效算子，因此不能只看到一行 layernorm 就误以为残差没了。
+一个教学 Pre-Norm 层可以写成 A=Attention(Norm(H))，U=H+A，M=MoE(Norm(U))，Hnext=U+M。这段表达用于理解数学；真实 fused residual 的中间存储顺序需要对照函数接口。各层有自己的权重与 KV 存储，上一层输出行是下一层输入行，不能跳过某层直接复用别层 K/V。
+@source models/qwen3_moe/model.py|Qwen3Model.forward|从 embed_tokens 开始，检查 layers.op_list 顺序、x/residual 的双返回值与最终 norm。
+@source models/qwen3_moe/model.py|Qwen3DecoderLayer.forward|依次定位 input norm、attention、post-attention norm、MoE，并追踪 residual。
+## 8.2 一次 Attention 的形状
+为了手算，取双头 h=2、每头 d=2、D=4，暂用 MHA。Hnorm[3,4] 分别乘 WQ/WK/WV[4,4]，得到 Q/K/V[3,4]，再看成 [3,2,2]。每头 QKᵀ 得 [3,3] 分数，缩放后施加因果 mask；位置 i 只能读不晚于 i 的位置。每行 softmax 后乘 V，得到每头 [3,2]，拼接并输出投影回 [3,4]。
+真实 GQA 中 Q head 数可大于 KV head 数，K/V 形状按 KV heads 计算，多个 Q heads 共享一组 K/V。RoPE 用 positions 旋转 Q、K；它不把 token id 当位置，也不替代因果 mask。Q/K norm、SWA 和 sparse attention 是否存在由模型与 backend 配置共同决定。
+## 8.3 写入位置不由 token id 决定
+Scheduler 分配的 out_loc 给当前输入行指定物理写入位置。以 Triton 后端为例，forward 先 store_kv(k,v,out_loc,layer_id)，再根据 metadata 和 phase 选择 decode 或 extend kernel。因而缓存 11 号 token 的位置不是“第 11 号缓存单元”，而是这条请求当前位置对应的已分配槽。
+@source models/qwen3_moe/attention.py|Qwen3MoeAttention.forward|沿 MoE 模型自己的注意力实现阅读投影、拆头、Q/K 处理、RoPE 与 backend 调用的顺序。
+@source attention/triton.py|TritonAttentionBackend.forward|确认 store_kv 的参数，再分别读 decode_paged_attention 和 extend_paged_attention 选择条件。
+## 8.4 Decode 改了什么
+当输入 id 8 时，当前 H 只有 [1,4]，Q/K/V 只有新位置的行；每层 Attention 用新 Q 读取该层已有 K/V，并加入新 K/V。过去 token 的前馈和投影通常不再重复执行，代价转为读取历史状态。输出仍为 [1,4]，继续进入同一层 MoE，再进入下一层。不是只跑最后一层，也不是只运行 router。
+@check 第 5 层能用第 4 层的 KV 代替自己的历史 KV 吗？|普通 Transformer 不能。两层权重不同、表示不同，缓存按层组织。这里不讨论另外设计的跨层共享模型。
+@check Prefill 为什么能并行计算多个位置，却仍保持自回归因果关系？|各位置 Q/K/V 可以成批投影；Attention mask 限制读未来位置。并行不意味着取消因果约束。
+@next Attention 已把上下文信息写回当前 hidden states。接下来进入最影响 FreeToken 特色的部分：prefill 时的整层专家搬运。
+
+@chapter 09|第四部　专家如何执行|Prefill 的整层双缓冲|明明路由只选 top-k，prefill 为什么往往要提前搬整层专家？
+@handoff 一段 prompt 的 hidden states、专家 host banks|按层预取、等待就绪、GPU 专家计算、释放缓冲|计算完当前层的 hidden states 与可复用的暂存区
+## 9.1 长 prompt 与短 decode 的差别
+一个 token 只选 2 个专家，但 1000 个 token 的选择并集可能覆盖大部分 E。若每层等 router 完成后才逐个收集缺失专家，可能既搬了大量数据又增加启动与同步开销。prefill 还有较多输入行，可把专家 GEMM 做得更大；用当前层计算时间遮住下一层权重传输就更有机会。
+在本提交的 offload prefill 路径，_prefill_routed 使用整层 materialization。开启 prefill_overlap 时，通过 _wait_prefill_overlap 调用 begin_prefill、预取当前层和下一层、等待当前层 ready，然后计算。关闭 overlap 时也有同步 materialize_layer 路径。**这里的回退不是自动变成 decode 式按需 top-k 搬运**。
+@source layers/moe.py|OffloadMoELayer._prefill_routed|对照 overlap 与非 overlap 两个分支。这里 expert id 在整层视图中仍表示行号，无需 decode 式 slot 改写。
+@source layers/moe.py|OffloadMoELayer._wait_prefill_overlap|把当前层和下一层两次 prefetch 画出来；layer_id=0 时开启一次 prefill。
+## 9.2 缓冲 A/B 必须有读写协议
+令偶数层使用缓冲 0，奇数层使用缓冲 1。计算层 0 时可搬层 1；层 2 再使用缓冲 0，但必须等层 0 的 GPU 读取结束。ready 事件表示拷贝完成，release 事件表示计算不再读该缓冲。它们方向相反，少任何一条依赖都可能把正在被 GEMM 读取的权重覆盖。
+begin_prefill 还要把新的拷贝工作排在先前 decode 后面。因为暂存区借用 GPU bank 空间，上一批 decode 也可能正在读那些字节。Python 函数返回“已经发起异步复制”，不等于旧读取已经结束。
+@figure prefill
+@lab prefill
+教学时间线取搬运 2 ms、计算 3 ms、4 层。串行总计 20 ms；双缓冲在 0..2 加载层 0，2..5 算层 0，同时 2..4 加载层 1。层 2 必须等 5 ms 才能覆盖 B0，5..7 加载，8..11 计算；最后在 14 ms 完成。这个例子保留了填充和排空开销，不能把加速粗略写成所有层都只花 max(2,3)。
+@source moe/offload_cache.py|OffloadMoeCache.begin_prefill|阅读与先前 decode 的事件依赖，区分普通路径和可选 hit-D2D 路径的同步。
+@source moe/offload_cache.py|OffloadMoeCache.prefetch_prefill_layer|追踪 buffer_id=layer_id%2、重复预取判断、旧缓冲 released 检查、copy stream 和 ready 事件。
+@source moe/offload_cache.py|OffloadMoeCache.release_prefill_layer|看 release 的记录时刻及末层暂存字节清理。当前版本不能笼统说“prefill 完专家一定全在 decode cache”。
+## 9.3 容量与命中复用的细节
+双缓冲需要足够暂存空间；engine 的预算和缓存布局共同检查可行性。当前实现还可选从稳定的已有 GPU 驻留区域 D2D 搬入暂存视图，以减少部分 H2D；这依赖稳定区域判定和专门的快照/复制逻辑。先学懂默认流程，再读 _prefetch_split，不要用一个概念图覆盖所有分支。
+@check 为什么层 2 不能在 4 ms 时开始覆盖 B0？|层 0 的计算持续到 5 ms，仍在读取 B0。拷贝流空闲也不意味着目标内存可写。
+@check 关闭 prefill overlap 后是否一定只复制 router 选中的专家？|本固定版本的 _prefill_routed 非 overlap 分支 materialize 整层。应看代码，不能套用另一个版本或论文摘要。
+@next Prompt 已执行完并选出“鱼”。进入下一轮 decode 后，输入行数很少，专家选择更稀疏，此时需要另一套缓存索引逻辑。
+
+@chapter 10|第四部　专家如何执行|Decode 的专家缓存|router 给的是专家 3，GPU kernel 为什么最后会读 slot 1？
+@handoff 本层 topk_ids、GPU 驻留映射与 host banks|查命中、去重、选择受害槽、复制并改写索引|可直接由专家 kernel 读取的 slot ids 与完整权重
+## 10.1 两个编号空间
+专家编号表达模型语义，slot 编号表达物理存放位置。完整专家身份是 (layer,e)，因为不同层的 expert 3 不是同一组参数。扁平 key 可写成 layer×E+e，但 GPU pool 里的 slot 只编号当前物理行。让 topk_ids 从 expert id 变为 slot id，是把逻辑路由接到物理缓存的关键一步。
+缓存同时维护正向 slot_for_id 和反向 id_of_slot，配合 usage/step。新专家写到某个 slot 时，必须清掉旧专家的正向映射；否则下次“命中”会拿到已经被覆盖的字节。这个错误通常不会表现为崩溃，而会表现为错误答案。
+@figure cache
+## 10.2 跟踪四槽教学缓存
+先用一个兼容布局的共享 pool。第 1 步路由 (0,1)、(0,3)，两个 miss 放入空槽；第 2 步路由 (1,1)、(1,4)，再放两个空槽；第 3 步路由 (0,1)、(0,2)，前者命中，后者需要驱逐一个非本步活动的旧专家。注意 (0,1) 与 (1,1) 在表里是不同 key。
+@lab cache
+这里 Python LRU 实验只解释身份和受保护集合，没有复刻 flashlib 并行内核、相同 timestamp 的精确 tie-break 或所有布局分支。验收重点是：当前需要的命中专家不被覆盖、正反映射一致、每个输出 slot 都指向对应专家。
+## 10.3 对照真实 decode 调用顺序
+OffloadMoELayer._decode_routed 在普通 GPU offload 分支调用 ensure_experts，再 copy_missing，最后 _expert_gemm。ensure_experts 只更新驻留计划与索引，不等于所有字节已搬完；copy_missing 才按 src_indices、evict_slots、num_indices 将 bank 数据填好。同一 stream 上的顺序保证后面的 GEMM 看见正确数据。
+@source layers/moe.py|OffloadMoELayer._decode_routed|分别标出 CPU-layer、hybrid、普通 offload 三个分支；当前章只展开最后一个。
+@source moe/offload_kernels.py|ensure_experts|本版本普通 LRU 委托 flashlib.lru_ensure；id_base 把本层局部 expert ids 映射进全局身份空间。不能声称普通路径的完整 LRU 内核都定义在这个仓库中。
+@source moe/offload_cache.py|OffloadMoeCache.copy_missing|观察跨 bank 共用 src/dst/count 的 fused copy 与逐 bank 回退，以及 pageable 整层分支的限制。
+## 10.4 当前版本不是任意专家共用一个池
+pool_policy.group_layers 的 unified 按 layout key 分组，兼容布局的层共享 pool；per-layer 则每层一个 pool。不同 slot 字节数、格式和 kernel 上限会限制分配。split_slots 可按层数或提供的频率 profile 分配额外槽。这比“全模型所有专家可随便放入任意 slot”更精确。
+@source moe/pool_policy.py|group_layers|检查 unified 与 per-layer 的定义；观察排序为何让较宽 slot 的 pool 靠前。
+@source moe/pool_policy.py|split_slots|核对 min/max 约束、单池特例和按 profile 分配；这些是容量分配策略，与逐步 LRU replacement 是两个层次。
+@check expert id 和 slot id 都恰好为 3，能说明不需要映射吗？|不能。只是本次数字相同。下次驱逐后 expert 3 可能在其他 slot，也可能不驻留。
+@check 普通 ensure_experts 的所有内部依赖都已包含在本地 FreeToken 快照吗？|不是。它调用外部 flashlib 的 slot cache。本书标注这一边界；本地能看到调用契约，不能冒充读过未采集依赖的实现。
+@next 如果缺失专家既可以搬到 GPU，也可以直接在 CPU 算，怎样决定搬几个？下一章先把时间模型推出来，再核对当前源码的取整规则。
+
+@chapter 11|第四部　专家如何执行|搬几个，算几个|CPU 比 PCIe 快，并不意味着所有缺失都应该留在 CPU：怎样算分工？
+@handoff 唯一缺失专家数 m、专家大小和有效带宽|建立并发关键路径模型，再映射到源码策略|本步 fill 数 q 与 GPU/CPU route 分区
+## 11.1 先把集合写清楚
+令 H 为命中的唯一专家，M 为缺失的唯一专家。把 M 分成 F 与 C：F 被搬到 GPU，C 在 CPU 原地计算。GPU 最终处理 H∪F，CPU 处理 C。它们必须不重不漏。q=|F|，m=|M|；别把 m 错写成 batch_size×top_k，那是 route 数上限，去重后可能小很多。
+为什么要保留 fill？本步 CPU 可以算完一个缺失专家，但若它以后常被选中，搬到 GPU 会让后续命中。反过来，一口气填满所有 miss 又可能被 PCIe 限制。因此这是本步关键路径与后续驻留的共同问题；本章的带宽模型只解决其中的时间分工。
+## 11.2 用同一单位推时间
+先采用简化模型：单专家 S 字节；有效 H2D 带宽 BP；主存侧总有效带宽 BH，且 BH>BP。若 DMA 与 CPU 争用主存，简化地把并发 CPU 剩余带宽记为 BH−BP。于是 fill 时间约 qS/BP，CPU 时间约 (m−q)S/(BH−BP)。两边重叠时较慢的一边决定结束时刻，因此应比较 max，而不是把两个时间相加。
+令两项相等，q(BH−BP)=(m−q)BP，得到 q*=mBP/BH。它依赖一系列假设：均匀专家大小、可重叠、忽略启动固定成本、CPU 计算可用带宽描述。若 BH≤BP，这个剩余带宽写法不再适用；也不应拿厂商标称值代替本机有效值。
+教学例子 m=8、S=64 MiB、BP=20 GB/s、BH=80 GB/s，q*=2。fill 两专家约 6.711 ms；CPU 六专家在 60 GB/s 下也约 6.711 ms。表中 GB/s 是十进制字节带宽，MiB 是 2²⁰ 字节，换算不能混掉。
+@lab hybrid
+## 11.3 当前源码比简化公式多了什么
+bench_profile.fetch_fraction 优先读取真正并发时测到的 PCIe gather 带宽 pcie_ov 和 CPU MoE 带宽 cpu_ov，返回 pcie_ov/(pcie_ov+cpu_ov)。这两个已经是同时运行时各自达到的速率，不应再把 cpu_ov 减一次 pcie_ov。缺少并发测量时才回退到独立测量的 pcie/cpu 比值并限制上界。
+Engine._resolve_hybrid_fetch 按格式、专家形状、top_k 和 CPU 线程数匹配 profile 行；自动模式某层缺少数据时，当前代码使用固定 cap=1。用户显式给 max-fetch 时按固定上限执行。**这不等于动态带宽规则永远至少搬一个**：内核比较 q* 两侧的整数代价，小 miss 与小比例可能选择 0，还会受可用槽限制。
+@source moe/bench_profile.py|fetch_fraction|仔细区分 overlap 两个速率的和，与 fallback 的 pcie/cpu；不要只摘一个比例用于所有情况。
+@source engine/engine.py|Engine._resolve_hybrid_fetch|看自动模式何时启用、如何匹配各层 profile、缺失行怎样回退。profile 不是所有硬件通用的常数。
+@source moe/offload_kernels.py|_ensure_experts_hybrid_kernel|Phase 1 去重并计算 miss 数，Q16 比例选 lo/hi；Phase 2 选择驱逐与填充；Phase 3 写 GPU/CPU 分区。
+## 11.4 搬谁也有区别
+同样 q=2，可以选不同的两个 missing experts。当前 hybrid 内核默认用 expert_recency 优先近期出现过的 miss，相同优先级以 id 打破平局；环境变量可改成 lowest_id。这是“选哪些 miss 值得填入”的策略；而 usage 上的 LRU 是“驱逐哪些旧 slot”，两者不能混称一个 LRU。
+@check 若并发测得 PCIe=20、CPU=60 GB/s，fraction 是多少？|20/(20+60)=0.25。它们是同时运行时的各自有效速率，不能套 20/(60−20)，也不能直接把 60 当总 BH。
+@check m=1 且比例很小时，源码会保证 q≥1 吗？|动态内核没有这个普遍保证；它比较两个整数候选，再受容量约束。缺少 profile 的固定 cap=1 是另一条路径。
+@next 我们知道了分区怎么选。下一章追踪真实张量怎样跨设备走一圈，以及两边如何避免重复计算。
+
+@chapter 12|第四部　专家如何执行|CPU 与 GPU 同时开工|CPU 只算少数 route 时，需要把整套模型来回搬吗？
+@handoff hidden_states、原始路由权重和分区计划|CPU 读 host experts，GPU 读 slots，按协议同步并合并|与原 MoE 语义相同的部分和总输出
+## 12.1 一个具体分区
+假设本层两条 route 是专家 3 和 7，3 已命中，7 分给 CPU。GPU 获得 slot(3) 和原权重 w3；CPU 那条 route 在 GPU 的权重置 0，slot 置 −1 或安全的 0。CPU 获得 expert id 7 和原权重 w7；专家 3 那条 route 的 cpu_id 为 −1。CPU 内核跳过负编号。
+若某个 GPU kernel 不支持跳过 −1，单把权重设 0 还不够：它可能仍然先读取 slot 内容。源码用 clamp 和可安全读取的 storage 约束这条路径，避免越界或 0×NaN。优化的正确性往往就藏在这些“即使权重为零也会读”的细节里。
+@figure hybrid
+## 12.2 小输入走出去，大权重留原地
+CPU 分支通常把当前 batch 的 hidden states、expert ids、weights 送到稳定主存 I/O，CPU worker pool 从 host banks 读取专家权重计算，再把 [bs,H] 的部分结果返回 GPU。往返的是当前激活与输出，而非每步把整个专家池或完整模型搬回去。
+_decode_hybrid 先 ensure_experts_hybrid，后 decode_submit，随后 copy_missing 和 GPU GEMM，最后 decode_sync 合并。先 submit 才能让 CPU 分支与后面的 GPU 工作发生重叠。如果 submit 后马上等待，虽然结果仍正确，但两条分支串行了。
+@source layers/moe.py|OffloadMoELayer._decode_hybrid|按代码实际顺序标记分区、submit、copy、GEMM、sync。FREETOKEN_HYBRID_OVERLAP=0 是隔离重叠收益的测量开关。
+@source moe/cpu_executor.py|CpuMoeExecutor.decode_submit|输入 GPU 激活与路由，发布给 CPU 执行器并立即返回 pending；阅读 pinned copy 路径和 kernel I/O 路径，而非假设只有一种。
+@source moe/cpu_executor.py|CpuMoeExecutor.decode_sync|等待完成、把 CPU 结果带回并可加到 add_to。名字里的 sync 是协议依赖，不代表必须用 Python 全设备 synchronize。
+## 12.3 为什么需要常驻线程与握手
+每个 token 每层都临时创建线程的代价太高。CpuMoeExecutor 初始化原生扩展和线程池，并让输入、输出、描述符与信号具有稳定地址。CPU 指令集、线程数、亲和性和 NUMA 会影响有效吞吐；A100 并不能告诉我们配套 CPU 的主存带宽。
+当前实现根据探测结果使用 flag publish/signal/wait、kernel I/O 或 host function 等路径。CUDA Graph 兼容性取决于这一协议是否可重放；探测不支持时，代码可能要求禁用图，而不是默默产生旧结果。Engine 每次 forward 还检查 executor 健康状态，避免 CPU 协调线程失效却继续用陈旧输出。
+## 12.4 怎样证明没有漏算
+数学上把选中集合拆为两个不交集合，只需验证加权部分和相加等于原和。CPU 实验 check 正在做这件事。实际量化路径还应与可信参考比较数值误差，检查不同路由、空 CPU 集合、全 CPU、全 GPU、重复专家和图回放多步。只有最终文本相同不足以证明内核正确，因为 argmax 可能掩盖 logits 误差。
+@check hybrid 的 CPU 输入可直接用改写后的 GPU slot ids 吗？|不可以。cpu_ids 必须保持逻辑 expert 编号，并用 −1 排除 GPU 分支；GPU slot 只在对应 pool 的 banks 中有意义。
+@check CPU/GPU 并发后，一层耗时总能写成两边时间的 max 吗？|那是理想近似。真实还包括发布、传输、同步、GPU 计算、共享带宽竞争和固定开销，需要时间线验证。
+@next 上面一直说 banks 与 kernel 的契约。下一章解释量化、布局与后端选择如何把这些抽象变成可执行算子。
+
+@chapter 13|第四部　专家如何执行|量化布局与算子选择|同样叫 4-bit 权重，为什么有的路径在 A100 上不能直接运行？
+@handoff 模型量化说明、各层 geometry 与设备能力|选择 method/kernel、定义 bank schema、打包并执行|符合具体 kernel 契约的 ExpertView 与专家结果
+## 13.1 三个层次别混掉
+量化格式描述数字怎样编码：例如 BF16、分块 FP8、不同 FP4 或 GGUF 类型。布局描述这些编码怎样在内存排列：分组、转置、交错、scale 的位置。kernel 描述哪种硬件指令和并行算法读取这种布局完成运算。名字都带 FP4，不表示格式、布局与硬件执行能力都相同。
+量化大小也不只“参数数÷2 字节”。有分组 scale、全局 scale、对齐、padding 与辅助数据。不同 kernel 还可能要求不同的 packed banks。读取 bank 时缺一组 scale 会改变数值；按错布局读则连矩阵对应关系都不对。
+## 13.2 计算层拿到什么
+OffloadMoELayer._expert_gemm 把当前 bank schema 和 views 组成 ExpertView，附上 slots 或整层 n、必要的 alphas，再调用 self.quant_method.apply。数据搬运侧负责提供可读的行，计算侧负责按 method 的布局解释这些行。因此同一套缓存控制能服务多种专家格式，而不需要缓存层手写每种 GEMM 的数学。
+@source layers/moe.py|OffloadMoELayer._expert_gemm|区分 views、slots、n、alphas。n 非空用于整层视图，decode 则由 slot 索引访问。
+@source layers/quantization/moe/base.py|MoEMethod|阅读 layout/pack/apply/cpu_spec 等接口，再回看 ExpertView，确认每层职责。
+@source layers/quantization/moe/base.py|MoEKernel|检查 unusable_reason、worth_it 和 slot_limit。这些方法说明“可以运行”和“值得采用”是不同判定。
+## 13.3 A100 要看实际路径
+A100 的 compute capability 是 SM80。它可以作为学习这些机制的 GPU，但没有新架构原生 NVFP4 执行能力。不能因为 README 展示 RTX 50 系列的结果，就复制其量化快速路径期待同样表现。本固定提交的 pyproject 还明确说明 Marlin 借用路径和核心 transformers 版本范围存在依赖冲突；因此本书 A100 初始实验不默认安装所有 NVFP4 相关组件。
+先选官方模型文档列出的、与当前环境兼容的 checkpoint 和 BF16/受支持 FP8 路径，确认 resolved backend、实际量化、CPU bank 格式和布局，再比较 offload/hybrid。若 checkpoint 没有 MoE 专家，_adjust_config 会走 dense/fused 逻辑，就测不到专家缺失优化。
+@source layers/quantization/moe/nvfp4.py|MarlinNvfp4MoEKernel.unusable_reason|确认依赖、平台和 common_reject 检查；仅有一个名为 Marlin 的类并不能证明当前安装可用。
+## 13.4 小 batch 和大 batch 不同
+prefill 一次很多 token，矩阵乘法可复用权重；decode 少量 token 更像 GEMV，小专家、路由分散时启动与带宽占比大。算子可能为这两个阶段分别选路径。CPU 专家执行也需要支持的激活与量化格式；“CPU 有 AVX”并不自动满足所有模型。
+@note 本章验收|给一层写出五项：格式、逻辑矩阵形状、物理 bank 布局、实际 kernel、硬件/依赖条件。五项都明确后，再谈这层是否跑到所谓 fast path。
+@check GPU 支持 BF16，是否就能高效直接执行任意 FP4 checkpoint？|不能。需要格式解码/转换、匹配布局、支持的 kernel 与硬件条件；也可能回退或拒绝。
+@next 算子已经选好。接下来要解决另一种开销：每个 token 都从 Python 发起大量小操作，怎样用 CUDA Graph 减少它？
+
+@chapter 14|第五部　让执行稳定又连续|动态路由与 CUDA Graph|每轮专家都在变，图回放为什么不会一直计算第一次的路由？
+@handoff 模型、稳定缓冲、支持的 batch sizes 和执行协议|预热、捕获、写入本步数据、回放|较少 CPU 发起开销的 decode logits
+## 14.1 固定的是执行结构，不是输入数值
+CUDA Graph 记录一组设备操作及其依赖。输入、输出地址需要稳定，但其中的数值每步可以更新。若缓存命中判断、miss 数量、src/dst 索引由设备端计算并放在固定缓冲中，后续操作根据设备端 count 工作，就能在固定形状的图中处理变化。
+相反，在 Python 中 `.item()` 读 miss 数、临时创建任意长数组再发不同操作，会把动态决策拉回主机，增加同步并妨碍捕获。理解这点比背“CUDA Graph 更快”重要：它解释了 offload cache 为什么有固定尺寸索引和 device count。
+@figure graph
+## 14.2 逐步读 GraphRunner
+_capture_graphs 为若干 decode batch size 建图。它创建 GraphCaptureBuffer，设置 dummy request，进行必要的 eager warmup，在 capture 范围记录 model.forward，并管理共用 memory pool。这里的预热可能短暂装入专家，但代码在各阶段 reset offload cache；这与正式服务长期满缓存是两件事。
+replay 先 copy_from(batch)，再按 padded_size 选图，调用 attention backend 的 prepare_for_replay，最后 g.replay。若真实 batch=3、可用图大小含 4，会用 dummy request 补到 4，并只取真实请求的 logits。dummy 必须指向安全的 scratch 状态，不能借用真实请求的可变槽。
+@source engine/graph.py|GraphRunner._capture_graphs|标出图缓冲建立、warmup、捕获、cache reset 和 graph_map 填充。只看到 warmup 一行不能判断服务起始缓存状态。
+@source engine/graph.py|GraphRunner.pad_batch|核对当前图形状选择和 dummy 请求数量，区别 padded_size 与实际 size。
+@source engine/graph.py|GraphRunner.replay|输入是本轮 Batch；copy_from 使图读新数据，prepare_for_replay 为具体 attention 后端准备必要快照。
+## 14.3 CPU 分支也有捕获条件
+CPU executor 的稳定 pinned I/O 和信号地址让 CPU 读到这一轮的真实激活与路由。发布、等待和结果合并必须组成可重放协议。当前代码不只依赖一种 host node，且在运行时检查 graph capture safe。不能承诺“任何 CPU 扩展都能放进图”。
+还要注意 stream 间的数据竞争。Scheduler 准备下一 batch 时可能改页表，而旧图仍在运行；某些后端必须在回放前快照元数据，避免下一轮改表影响在途读取。优化省掉的不是所有同步，而是保留必要依赖、减少不必要的主机往返。
+## 14.4 什么时候没有用图
+本版本 can_use_cuda_graph 要求 decode 且 batch size 不超过最大捕获值。prefill 仍可 eager 运行；关闭图也能验证模型和缓存逻辑。图捕获是否成功、内存是否够、CPU 握手是否支持，都应从日志和实测确认。
+@check 图捕获后修改同一 input buffer 的内容，图会读到新内容吗？|会；稳定地址不意味着数值不可变。路由动态性正是通过本步数据和设备内决策保留的。
+@check 修改专家缓存容量后能直接复用旧图吗？|不能假设可以。旧图可能捕获旧地址、缓冲大小和协议，需要按重建路径销毁并重新捕获。
+@next 专家缓存负责权重，Attention 状态又由另一组池负责。下一章把分页、页表、前缀匹配和引用寿命放在一起看。
+
+@chapter 15|第五部　让执行稳定又连续|KV 分页与前缀复用|请求结束后，为什么还有 KV 占显存？这算泄漏吗？
+@handoff 精确 token 前缀、请求表和 KV 资源|匹配缓存、分配页面、锁定引用、写入及回收|可由 attention 读取的历史状态与可复用前缀
+## 15.1 一页不是一个专家
+专家 slot 保存权重；KV page 保存过去 token 的中间状态。前者按 (layer,expert) 识别，后者与某条精确输入前缀及位置有关。两种缓存都叫 cache，但 key、数据、来源和寿命不同。把 KV 命中率当专家命中率，性能分析就会得出错误结论。
+普通分页教学取 page_size=4，逻辑 page table=[7,2,9]。位置 p=5 的逻辑页为 1，页内偏移 1，对应物理页 2，线性 slot=2×4+1=9。模型仍认为它在位置 5，RoPE 使用 5；物理 slot 9 只影响存取地址。源码 Context.page_table 的展开方式与本教学小表不完全相同，具体应沿 _write_page_table 查看。
+@figure kv
+@lab kv
+@source scheduler/cache.py|_write_page_table|观察页面 id 怎样写成 token 位置可索引的表项，别把本书逻辑页表示法直接当真实张量 shape。
+## 15.2 Radix tree 保存什么
+RadixPrefixCache 按 token 前缀压缩路径，节点关联对应 KV 索引。新请求的 ids 从根匹配，直到某个 token 不同；匹配长度可能受页对齐等约束。匹配到的状态需要 lock，防止运行时被驱逐；请求不再使用后 unlock，之后可以作为可驱逐的可复用状态保留。
+CacheManager.match_req 特意最多匹配到 input_len−1，因为只保存 KV 不等于保存末尾采样所需 logits。即使 prompt 完全重复，仍可能需要处理最后位置来得到输出分布。前缀缓存和“整条请求结果缓存”不同。
+@source kvcache/radix_cache.py|RadixPrefixCache.match_prefix|沿 _tree_walk 看精确 token 匹配，注意返回 handle 与索引不是生成文本。
+@source scheduler/cache.py|CacheManager.match_req|核对 input_len−1 的截断和 ordinary/hybrid/SWA 分支，理解“最多可复用”的上限。
+@source kvcache/radix_cache.py|RadixPrefixCache.lock_handle|观察锁定引用与可驱逐/受保护容量的变化；命中后不锁定会和后续分配产生冲突。
+## 15.3 释放有两个层面
+活动请求结束，需要释放请求表和活动引用。一部分 KV 可插入 prefix cache，继续占物理页，等待下次精确前缀命中；容量紧张时再驱逐。这不是自然等同于泄漏。判断泄漏要看无法回收的孤立分配、引用计数不平衡或容量账本不一致，而不只是看显存使用没立即下降。
+SWA 只需保存窗口相关状态；MLA、压缩/稀疏注意力使用专有 geometry；混合递归模型还需快照。引擎通过 pool family 与 cache manager 分支处理这些差别，不能所有模型都套“所有层 K,V 各一张完整历史表”。
+@check 两个语义相似但 token ids 不同的 prompt，会自动共享所有前缀 KV 吗？|不会。这里匹配精确 token 前缀，不是向量相似度搜索；不相同的历史状态不能随意互换。
+@check 位置 p=4、P=4、table=[7,2,9] 时应写到哪？|逻辑页 1、偏移 0、物理页 2、线性 slot 8。位置编码仍是 4。
+@next 对普通全注意力，前缀的每个位置有 KV。递归注意力却把历史压在一个状态里，下一章解释为什么必须存边界快照。
+
+@chapter 16|第五部　让执行稳定又连续|递归状态与边界锚点|只改了工具调用后的一段文本，为什么不能继续用旧的最终状态？
+@handoff 精确匹配前缀与混合模型的状态快照|选择可恢复边界、复制到活跃槽、重算后缀|与新前缀一致的递归状态及 KV
+## 16.1 从一个递推式理解问题
+普通 Attention 保存各位置 K/V。线性注意力或其他递归模块可以抽象为 s_t=f(s_(t−1),x_t)。只拿到 s_10，通常无法反推出 s_7；因此“前 7 个 token 没变”不意味着能把最终 s_10 裁短。如果工具调用返回内容被改写，改写点之后的旧状态就不再对应新历史。
+教学旧 ids 长 10，新 ids 前 7 个相同，后缀不同；已有快照长度为 4、6、10。最近可用快照是 6，不能选 10。若新长度 9，就从位置 6 开始处理 3 个 token。即使普通 KV 能精确匹配到 7，递归层也只能从已保存的边界恢复，整个模型需要尊重这层限制。
+@figure anchor
+@lab anchor
+## 16.2 “语义锚点”的语义在哪里
+锚点可能安排在工具调用等结构边界，这种位置更可能在后续历史编辑中保留。它不是把不同文字按语义相似度映射到同一个状态；正确性仍要求边界前的精确 token 历史一致。边界位置、特殊 token 检测和 chunk/page 对齐也必须满足实现条件。
+当前 CacheManager.snapshot_toolcall_anchor 会检查 hybrid 模式、anchor、ping-pong 槽、cached_len 恰好到边界及页对齐，然后在 engine stream 上复制状态。结果提交发现 tool-call opener，记录的是边界长度；**不能在采样刚得到 opener 的瞬间就认为它的输入计算已经完成**。第 7 章的“已知/已计算”差别在这里再次出现。
+@source scheduler/cache.py|CacheManager.snapshot_toolcall_anchor|逐项写下提前 continue 的条件。特别是 cached_len==anchor_len，以及它为何在当前步前向前执行。
+@source kvcache/hybrid_radix_cache.py|HybridRadixCache.match_prefix|先匹配 token，再向祖先寻找仍有 live snapshot 的最深节点；并非只看最长字符前缀。
+## 16.3 为什么快照不能原地继续改
+同一个树节点的快照可能服务多个后续请求。如果请求直接把它当活跃状态更新，后来的请求会读到被污染的历史。恢复时需要把快照复制到自己的 live slot；运行中还用 track/ping-pong 槽形成可捐赠的边界快照。快照的 lock、evict 和 live 请求槽的释放，是另一套资源账本。
+HybridRadixCache 为 full KV 与 mamba snapshots 分别记录可驱逐量；可能出现节点还有路径/KV，但 snapshot 已被驱逐的情况，匹配时必须往上退。不同模型的状态 shape、dtype 和额外 slot states 由模型/状态池契约管理。
+@source kvcache/linear_state_pool.py|LinearStatePool.copy_from|看状态复制的范围，理解“恢复一个请求”不是复制一个抽象整数编号。
+@source scheduler/scheduler.py|Scheduler._restore_linear_states|查看恢复发生的 stream 和调用时机。它必须排在读 live state 的前向之前。
+@check 最长 token 前缀命中 7，但最近 live snapshot 在 6，应从哪恢复？|从 6。不能假装有长度 7 的递归快照；KV 匹配量与模型整体可恢复量可能不同。
+@check 工具边界的特殊 token 刚被采样出来，状态快照就一定包含该 token 吗？|不是。它要在后续作为输入完成计算后，cached_len 才达到对应边界。代码按这个时机冻结状态。
+@next 全部模型层已经算完。下一章回到 logits，跟着 next id 完成采样、提交、文本流和取消处理。
+
+@chapter 17|第六部　把完整服务接起来|采样、返回与取消|EOS 已经生成了，为什么还有几处函数必须继续处理？
+@handoff 当前批 logits 与每条请求的生成设置|选 next id、提交结果、判断终止、生成文本增量并清理|用户收到内容，活动请求资源按顺序释放
+## 17.1 LM head 不是 tokenizer.decode
+模型末尾 hidden states 经词表投影产生 logits。prefill 有多个输入行，但生成只需要各请求最后有效位置对应的分布；后端元数据与 LM head 共同完成这层选择。decode 每个真实请求通常只贡献一个当前行。最后的 logits 形状按真实输出请求组织，而非把每个 prompt 位置都送给用户。
+Sampler.prepare 为 batch 构造温度、top-k/top-p、greedy mask 和 penalties。Sampler.sample 在纯 greedy 情况直接 argmax；混合采样批次也为 greedy 行显式选 argmax，避免把近零温度当成严格 greedy 的替代。路由 top-k 与这里词表采样 top-k 是两个不同空间。
+@source layers/embedding.py|ParallelLMHead.forward|prefill 先用 metadata.get_last_indices 选每请求最后有效行，再做词表投影。多卡路径还要收集分片词表 logits。
+@source engine/sample.py|Sampler.prepare|读每条请求如何产生 batch 参数，注意 penalties 的输出 token 计数与 overlap 的关系。
+@source engine/sample.py|Sampler.sample|标出 argmax、概率采样、混合 greedy mask 与输出计数更新。它返回 token ids，还没有返回中文文本。
+## 17.2 异步结果怎样安全提交
+Engine.forward_batch 返回 next_tokens_gpu、next_tokens_cpu、copy_done_event。Scheduler._forward 把 GPU ids 写到 token_pool；_process_last_data 等 copy_done，再 append_host，依次判断 EOS、输出预算、stop strings，构造 DetokenizeMsg，并释放结束请求的活动资源。
+默认 overlap 可能在处理上一轮停止条件前已经排了下一轮。代码用 finished_reqs 等保护，避免向已终止用户继续发送多余 token 或二次释放。教学串行轨迹只表示必要的逻辑前向次数，不承诺真实时间线中永远没有被提前排入的计算。
+@figure serving
+@source scheduler/scheduler.py|Scheduler._process_last_data|重点看 copy_done.synchronize、ChunkedReq、aborted、append_host、finished 判定与 _free_req_resources 的先后关系。
+## 17.3 为什么 token 不能随到随发
+tokenizer.decode 可能遇到不完整的 Unicode 字符、字节片段或跨 token 的 stop 字符串。DetokenizeManager 要保留必要尾部，找到安全可打印增量；stop 的前缀也不能提前泄露到客户端再撤回。协议层还会把增量解析成 content、reasoning 或 tool-call 事件，再包装成 OpenAI/Anthropic/Responses 的字段。
+@source tokenizer/detokenize.py|DetokenizeManager.detokenize|看状态缓冲与 finished 处理，区分 next_token、decoded text、incremental output。
+@source server/generation.py|generate_events|共享生成事件入口；不同协议由各自适配层消费事件，不是每种协议各训练一个模型。
+## 17.4 用户断线也会改变资源寿命
+FrontendManager.stream_with_cancellation 检测断线并发送 AbortMsg。若该请求有在途前向，Scheduler 不能马上把页表行与 KV 分给别的请求；它先记录 aborted，等该 batch 排空后再清理。否则旧 GPU kernel 会把新请求的数据当成自己的输入，或覆盖新状态。
+@source server/api_server.py|FrontendManager.stream_with_cancellation|从连接异常跟到 abort_user，再沿消息到 Scheduler。网络已结束不代表 GPU 已停止读取。
+@check top_k=2 的 router 与 sampling top_k=2 选的是同一类对象吗？|不是。前者选专家，后者在词表中筛选候选 token，两者形状、参数和作用完全不同。
+@check abort 一到就 free 页表，性能不是更好吗？|在途 batch 仍可能读取该内存。必须先建立完成依赖或排空，再释放与复用，才能保证正确性。
+@next 到这里一条请求已闭环。下一章讨论服务运行时改变池容量，为什么这是一笔需要排空和重建的操作。
+
+@chapter 18|第六部　把完整服务接起来|运行时调整容量|为什么调一个显存滑块，不能只给 Python 字段赋一个新值？
+@handoff 新容量请求、当前池 geometry 与在途工作|等待安全点、校验预算、重建并重新捕获必要图|新的可服务容量，或明确的拒绝/失败回复
+## 18.1 容量背后有真实地址
+增大专家 slots 不只是改 cache_size：GPU banks、映射、copy plan、kernel 可访问范围和捕获图可能都引用旧地址。KV pages 与递归槽也关联页表、free list 和 prefix tree。若在活跃请求执行中替换它们，会破坏仍然有效的引用。
+当前 Scheduler 将 rebuild 请求排队，在没有 last_data、没有待 prefill 和运行 decode 的安全点执行。已结束请求的历史记录不自动阻塞，因为其活动 GPU 资源已经释放。这个条件是本版本的具体行为，不能说“随时边推理边改所有池”。
+@source scheduler/scheduler.py|Scheduler.overlap_loop|定位 _pending_rebuild 的 gate：last_data 与两个 manager 的 runnable。再看普通循环对应的 gate。
+## 18.2 先验证，再进入不可原样服务的阶段
+Engine.rebuild_runtime_cache 校验新 geometry、预算和模型/pool 限制，再处理必要的释放与重建。只改专家池与改 KV/状态池的失效范围可能不同；不能一律声称所有前缀都保持，也不能一律声称所有前缀都清空。必须看请求触及哪些池以及实际分支。
+上游显式记录 rebuild_teardown_started，用来区分“拒绝时旧池仍完好”与“已拆旧资源后发生失败”。前者可以直接继续旧配置；后者可能要恢复旧 geometry。单卡与 TP>1 的回滚也不同，因为多个 rank 不能各自进入不一致的同步路径。
+@source engine/engine.py|Engine.rebuild_runtime_cache|按验证、teardown、分配、重新捕获和配置更新几个阶段阅读，标明旧图何时失效。
+@source scheduler/scheduler.py|Scheduler._execute_pending_rebuild|核对 rejected、failed、单卡回滚与 TP 多卡失败锁定。不要把成功发送回复与实际重建混在同一个异常范围。
+## 18.3 怎样理解弹性
+弹性是运行时能在明确条件下调整缓存预算，不代表系统从此不需要重分配、不存在暂停或失败。host expert pool 能继续作为权重源，省掉重新从磁盘装整模型的工作；但 GPU 空间重排和图捕获仍有代价。
+做实验时记录修改前后实际 slots、pages、状态槽、图设置、停顿时间和错误状态，再发同一请求检查服务是否恢复。首次学习先读控制 API 和 `ft ctl --help`，不要在共享服务中直接尝试极限容量。
+@check 因参数非法而在 teardown 前被拒绝，是否必须重新加载模型？|通常旧资源仍完好，本版本会拒绝这次修改并保留服务；需按实际异常与日志判断，不能把所有 rebuild 错误都当致命退出。
+@next 主线已经完整。下一章把离线、多模态、多卡与守护进程接回这张地图，说明哪些部分复用、哪些边界改变。
+
+@chapter 19|第六部　把完整服务接起来|把扩展分支接回主线|换成离线生成、图像输入或多卡，前面的架构还成立吗？
+@handoff 单卡文本主线与不同入口/模型需求|识别复用的调度计算骨架及新增边界|能定位扩展代码且不误套主线假设的架构图
+## 19.1 离线 LLM 是一个更短入口
+本版本 LLM 继承 Scheduler，使用 offline_mode，自己维护 pending_requests/status_map。generate 把 prompts 和 sampling_params 放入待处理列表，run_forever 运行同一调度骨架，直到 RequestAllFinished；offline_receive_msg 构造 UserMsg，offline_send_result 收集输出 token，最后 decode 为文本。
+因此离线没有必要经过 HTTP、SSE 和在线 FrontendManager 的所有通道，但仍要加载模型、分配缓存、调度和执行。raw string 的离线 tokenization 也不自动等于在线 messages 的聊天模板。想做公平比较，要把最终 ids 和设置对齐。
+@source llm/llm.py|LLM.generate|先画调用到 run_forever 的回路，再看离线收发方法如何替换在线 I/O。
+@source llm/llm.py|LLM.offline_receive_msg|输入 prompt 列表，输出 UserMsg；检查 uid 和 status_map 的建立。
+## 19.2 多模态增加一条编码支路
+图像先由 processor 处理并替换 prompt 中相关占位区间，产生 mm_items 和可能的 mRoPE 位置。Scheduler 规划当前 chunk 的 encoder jobs、gather plan 和行映射；Engine._run_mm_encoder 运行/复用编码结果，再把视觉 embedding 合入语言模型输入。
+因此图片不是先完整“变成一句描述”再送入文本 tokenizer，也不是所有模型的图像位置都只用一个普通一维位置整数。不同模型的 image span、双向注意力规则与编码器生命周期要看相应架构。
+@source mm/processor.py|MMProcessor.apply|从 ids 与图像读取到替换后的 ids/mm_items，追踪长度和位置怎样变化。
+@source scheduler/scheduler.py|Scheduler._gather_multimodal|这里准备 jobs、plan、rows；真正 encoder 执行在 Engine，不要把计划函数当 GPU 计算函数。
+## 19.3 多卡增加通信与一致性约束
+TP 把部分权重和计算分在多个 rank。线性投影、head 切片、专家中间维、collective 等需要一致的分片规则；有些数据可复制，有些要 all_reduce/all_gather。层中 _maybe_all_reduce 提示本地专家输出还可能需要跨 rank 合并。本书单 A100 实验固定 TP=1，不能据此声称已经验证多卡正确性。
+@source distributed/impl.py|DistributedCommunicator|找到 all_reduce 与 all_gather 的接口及 Torch/PyNCCL 实现。图捕获与通信资源销毁也要考虑顺序。
+## 19.4 运行管理不等于模型前向
+daemon 管理服务进程、状态、切换与恢复；shell 提供交互；ft launch 帮外部客户端配置 provider；它们最终围绕同一个模型服务工作。它们的重要性在部署生命周期，不在把一个 expert 矩阵乘快。阅读时先按“谁创建/监督谁”定位，再回到每 token 执行路径。
+|扩展|新增输入或状态|主线中不变的关键点|
+|离线|本地 pending/status_map|UserMsg、调度、Engine、缓存|
+|多模态|图像编码结果、区间与 mRoPE|请求身份、batch、模型层与输出提交|
+|TP 多卡|rank、分片、collective|各 rank 的数学一致性和资源依赖|
+|daemon/agent|进程与 provider 配置|服务请求最终进入同一执行骨架|
+@check 用 LLM.generate(raw_string) 和 chat/completions(messages) 得到不同回答，能直接判定离线内核错吗？|不能。先比较模板后的 ids、采样设置和 checkpoint，再检查数值；入口差异就可能改变输入。
+@next 最后一部从可运行的 CPU 实验开始，再给单 A100 一条分阶段、可验收的实机路线。
+
+@chapter 20|第七部　动手与复盘|实验指南：先算清，再上 A100|今天打开终端，具体先做什么、留下什么证据才算学会？
+@handoff 本教材、Python，以及可选的 Linux A100 服务器|依次运行教学实验、核对源码、建立实机基线和单变量对照|数值记录、资源状态表与有条件可复现的测量结果
+## 20.1 第一阶段：本机 CPU，约 90 分钟
+在教材目录打开终端。下面只运行本书独立的教学脚本，不安装或导入真实 FreeToken，不需要 GPU，也不下载模型。每个结果的 label 都标出它是模型、控制流还是理想时间假设。
+~~~
+python labs/run.py check
+python labs/run.py moe --out moe-result.json
+python labs/run.py cache --out cache-result.json
+python labs/run.py hybrid --out hybrid-result.json
+python labs/run.py prefill --out prefill-result.json
+python labs/run.py kv --out kv-result.json
+python labs/run.py anchor --out anchor-result.json
+python labs/run.py request --out request-result.json
+python labs/run.py budget --out budget-result.json
+~~~
+|实验|先做的预测|验收标准|
+|moe|只看 logits，选出两个专家|ids=[3,7]，权重和为 1，输出约 [0.033,0.066,0.099,0.132]|
+|cache|手写第 3 步之前/之后的槽表|(0,1) 命中，本步活动命中不被驱逐，slot 映射能反查|
+|hybrid|m=8 的最优整数 q|假设下 q=2，关键路径约 6.711 ms；不称为实测|
+|prefill|标出 B0 可被覆盖时刻|层 2 从 5 ms 搬入，总 14 ms；串行 20 ms|
+|kv|先不看输出计算 p=4、5|线性物理 slot 分别为 8、9；position 仍为 4、5|
+|anchor|前缀相同 7，快照 4/6/10|恢复长度 6，新长度 9 重算 3 tokens|
+|request|prefill 后“鱼”是否已有 KV|已知 4、已计算 3；EOS 后必要已计算位置为 4|
+check 的 assertions 检验加权分支等价、关键缓存/分页/快照状态及时间模型等。它们不是对真实 CUDA 内核的测试。请把每个 JSON 中的输入、输出和假设抄到学习记录，能解释字段才算完成。
+## 20.2 第二阶段：固定源码阅读，约 2 小时
+按这个顺序打开绿色源码卡：Engine.forward_batch → Scheduler._schedule_next_batch → _prepare_batch → Qwen3MoeMLP.forward → _decode_routed → _decode_hybrid → copy_missing → _process_last_data。每个函数写四行：调用者、主要输入、修改的状态、返回给谁。不要把整函数复制进笔记当作理解。
+本地快照是阅读选集，缺少完整仓库其他资源与依赖，不作为安装目录。实机请克隆完整官方仓库并 checkout 本书 commit。
+## 20.3 第三阶段：Linux A100 环境核验
+先记录 GPU 型号及显存、驱动、CPU/NUMA、内存和工具链。本固定提交的安装文档要求 Linux x86_64、NVIDIA r580+ 驱动/CUDA 13 工具链、Python≥3.10；pyproject 限定 torch≥2.14,<2.15、transformers≥5.18,<5.19。不能照其他时期的 CUDA 12 环境命令硬装后再把依赖失败当算法问题。
+~~~
+nvidia-smi
+nvcc --version
+lscpu
+free -h
+git clone https://github.com/FlashML-org/FreeToken.git
+cd FreeToken
+git checkout e4f69d9e232448fc168389c29f6f9364869cff35
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e '.[accel]'
+ft --version
+ft serve --help
+ft bench bw --help
+~~~
+本书不替你修改服务器驱动，也不在当前 Windows 环境安装这套 CUDA 依赖。若上面的依赖/工具链不匹配，先解决并保存日志；未完成环境核验，就停在这里，不要开始比较 tokens/s。
+## 20.4 第四阶段：先验证一条请求
+选择官方 models.md 列出的、host RAM 与显存均能容纳必要部分的 MoE checkpoint。首次优先使用当前环境确实支持的 BF16/FP8 路径，避开未核实的 NVFP4 特定快速路径。下面的 MODEL_PATH 必须换成你实际已下载的兼容模型；不预设 A100 是 40G 还是 80G，也不默认你有几百 GiB RAM。
+~~~
+export MODEL_PATH=/absolute/path/to/your-supported-moe-checkpoint
+ft serve --model "$MODEL_PATH" --moe-strategy offload \
+  --attention-backend triton --max-running-requests 1 \
+  --cuda-graph-max-bs 0 2>&1 | tee offload-eager.log
+~~~
+另一终端进入教材目录，运行本书的 HTTP 客户端。它查询 /v1/models 得到真实 model id，发送固定请求，保存原始 SSE 与可见内容事件的到达时间。
+~~~
+python labs/http_probe.py --out offload-eager.json
+~~~
+验收：服务日志 ready；Resolved config 是预期 offload/attention；请求能结束；JSON 含 model、usage、内容事件和总时延，无 error。客户端记录的是应用侧时间，content event 也不保证一事件一 token，不能直接当 GPU ITL。先用短输出核对模型可工作，再固定较长输出用于稳定测量。
+## 20.5 第五阶段：一次只改变一个因素
+完成基线后，先停止当前实验服务，再用相同 checkpoint、prompt、输出预算、temperature、KV 预算与 CPU 线程设置逐项改变。启用图时只改图设置；比较 hybrid 时先测 bandwidth 并核对 profile 行命中，再改 moe-strategy；比较 prefill overlap 时只改对应开关。每种配置先独立记录冷启动/首请求，再预热后至少测 5 次，报告中位数与范围。
+~~~
+ft bench bw --model "$MODEL_PATH"
+
+# Use the same serve flags as the baseline, changing only this strategy:
+# --moe-strategy hybrid
+# For graph A/B, change only --cuda-graph-max-bs 0 to 1.
+# For prefill A/B, add only --disable-moe-prefill-overlap.
+~~~
+记录实际 expert slots、KV pages、CPU 线程、有效带宽、命中/搬运统计（若启用）、prompt/output 实际 token 数、应用侧首内容时间与总时延。短输出可能只测到固定开销；仅对比一条文本不足以确定优化有效。
+## 20.6 读上游测试，再安排实机验证
+先读下面两个测试。第一个用可控替身检查 expert ids 被改写为 slot ids 后，GEMM 收到的是新索引；这验证调用契约，不是实际 CUDA 数学性能。第二个构造 standalone/overlap profile，验证当前比例选择和硬件/版本过滤。把“mock 控制流测试”“真实内核数值测试”“完整服务跑分”区分开，才知道已有证据能支持多大结论。
+@source tests/moe/test_offload.py|test_offload_moe_layer_decode_forward_uses_remapped_slot_ids|测试把逻辑 [2,1] 改写为物理 [5,0]，检查下游收到新值。它并没有真的测 GPU expert GEMM。
+@source tests/moe/test_hybrid_fetch.py|test_layer_kind_rows_give_fetch_fractions|检查并发比例 30/(30+90)=0.25 优先于 standalone 比例 40/100=0.4，及 profile key 对线程数的区分。
+在完整、已安装的官方仓库中，可以先运行较小测试，再读 benchmark 的 --help。以下命令列为服务器练习，当前未执行；GPU/格式条件不满足时的 skip 不能当作通过真实内核验证。
+~~~
+uv run pytest tests/moe/test_hybrid_fetch.py
+uv run pytest tests/moe/test_offload.py -m 'not slow'
+python benchmarks/bench_decode_moe.py --help
+python benchmarks/bench_offload_cache_copy.py --help
+~~~
+bench_decode_moe 会启动服务并包含完整链路成本；bench_offload_cache_copy 则隔离缓存索引与复制，不需要真实 checkpoint。运行较大 sweep 前先核对形状、显存与耗时范围。两种测量互补，但 microbenchmark 变快不能自动推出端到端生成同等加速。
+@note 实机结果状态|以上为依据固定源码及文档编写的操作指南，尚未在你的 A100 服务器执行。遇到不支持格式、pin 失败或握手探测失败，应先收集实际错误和 resolved config，再决定后端或关闭图的调整；不要伪填预期跑分。
+@check SSE 收到 10 个事件，能说生成了 10 个模型 token 吗？|不能。事件可能含角色、空增量、reasoning、tool 或多个 token 的累计文本。应读取服务器 usage，并用 tokenizer/服务端计时分析 token 粒度。
+@next 最后用一张“调用者—数据—状态”总表把全书重新拼起来，检查你是否能脱离章节标题复述一次生成。
+
+@chapter 21|第七部　动手与复盘|把一次生成完整复述出来|不看目录，能沿着“小猫喜欢吃 → 鱼 → EOS”讲完全部架构吗？
+@handoff 各章的局部输入输出与资源账本|合并主线、区分时序、审查常见错误|一份可用于讲解或排错的端到端模型
+## 21.1 第一张表：前向之前
+|顺序|调用位置|输入 → 输出|状态变化|
+|1|协议 handler / submit_generation|messages → 生成描述与 TokenizeMsg|前端登记 uid 与回复通道|
+|2|TokenizeManager.tokenize|模板文本 → CPU int32 ids|生成 UserMsg，真实长度确定|
+|3|Scheduler._process_one_msg / PrefillManager|UserMsg → 等待请求与可执行 Req|匹配前缀、保留必要资源|
+|4|_schedule_next_batch / _prepare_batch|Req 集合 → ForwardInput|分配页、positions、out_loc、元数据和采样设置|
+本书 ids=[11,10,7] 是第 2 步之后的教学替身。它跳过真实模板编号，却没有跳过后续调度和缓存所需的长度关系。若你要用真实模型替换它，先运行实际 tokenizer，重新记录 ids 与 special tokens。
+## 21.2 第二张表：一次模型执行
+|顺序|处理|主要形状/身份|必须保留的对应关系|
+|5|Embedding|N → N×D|每一行对应请求位置|
+|6|每层 Norm、QKV、RoPE、Attention|N×D → N×D|本层历史状态、position 与 out_loc|
+|7|router|N×D → N×E → N×k|专家逻辑身份、route 权重|
+|8|prefill 或 decode 专家路径|整层视图或 slot 视图|bank 布局与索引空间必须一致|
+|9|hybrid（若使用）|H∪F 与 C 部分和|每条 route 恰好被算一次|
+|10|残差、下一层、最终 norm/LM head|hidden → 每请求词表 logits|取最后有效位置，不混 padding 行|
+对于“鱼”这一轮 decode，N=1 而不是重算四个 token；但仍须经过每一层。专家集合每层都可能不同，缓存驻留跨层变化。图回放也仍执行这些数学操作，只减少主机发起成本。
+## 21.3 第三张表：前向之后
+|顺序|处理|产生什么|为什么不能省|
+|11|Sampler.sample|next token GPU ids|logits 不是文本|
+|12|GPU token_pool 写入、异步 D2H|next_tokens_cpu 与 copy_done|下一步设备输入与 CPU 结果同步|
+|13|_process_last_data|host ids、终止判定、DetokenizeMsg|不读未复制完成的数据，不重复终止|
+|14|Detokenizer / 协议适配|安全文本增量、usage、finish reason|字符边界、stop 与工具事件正确|
+|15|资源释放/缓存保留|活动引用归还、可复用前缀保留|结束请求与保留缓存寿命不同|
+普通教学串行路径必要前向两次：prefill 选“鱼”，decode 输入“鱼”选 EOS。默认重叠调度可提前排入额外一步；看性能或状态快照时要以源码时序与实际 trace 为准。若只背两次前向而忽略在途状态，就无法解释取消与二次释放保护。
+## 21.4 用症状反查层次
+|症状|先看什么|暂时不要下的结论|
+|首请求非常慢|权重/JIT/图捕获/首次分配与冷缓存|直接说 decode 算法慢|
+|长 prompt 慢|prefill 实际行数、专家搬运和 overlap|只看单 token 带宽|
+|hybrid 比 offload 慢|CPU/NUMA/profile 行/线程、真实分区和同步|把 GPU 型号当全部机器能力|
+|重复 prompt 仍计算末 token|match_req 截断、logits 与状态快照边界|立即判定缓存坏了|
+|关闭图正常、启用图错误|地址、metadata 快照、CPU 协议与 padding|只改温度或 prompt 掩盖问题|
+|结束后仍占显存|prefix cache、expert residency、图内存池|直接把所有驻留叫泄漏|
+@check 请口述“router 的 expert id 怎么最后变成用户看到的一个字”。|expert id 选择专家 → cache 映射/分区 → bank GEMM 与加权和 → 后续层与 LM head → token id 采样 → 结果提交 → tokenizer 增量解码。expert id 本身不会直接变成汉字。
+@check 若想优化一次 token 生成，应该先改哪个 kernel？|先确认端到端关键路径：调度、Attention、expert miss/copy、CPU compute、GPU GEMM、采样或服务提交。没有测量就无法知道哪个 kernel 值得改。
+@next 附录给出源码路线、术语和证据范围。以后复习时，可以从那里快速回到某一条真实调用链。
+
+@chapter 22|第七部　动手与复盘|源码路线与术语索引|怎样从“读过教材”走到自己能定位问题和验证判断？
+@handoff 全书架构与教学实验结果|按问题组织精读路线，核对来源与实现边界|可重复使用的源码阅读与验证清单
+## 22.1 三条精读路线
+第一条是请求路线：cli._run_serve → server.launch.launch_server → 前端共享生成接口 → TokenizeManager → Scheduler → Engine.forward_batch → Sampler → _process_last_data → DetokenizeManager。目标是给每条消息标 uid、方向、输入和结束条件。
+第二条是专家路线：Qwen3MoeMLP.forward → OffloadMoELayer.forward → prefill/decode 分支 → OffloadMoeCache → offload_kernels/flashlib → copy_missing → quant_method.apply；hybrid 另接 CpuMoeExecutor。目标是区分原始 expert id、pool slot、route 权重、src/dst indices 和 device count。
+第三条是状态路线：CacheManager.match_req → prefix cache → allocate_paged/_write_page_table → backend store_kv/read → cache_req/free；hybrid radix 再接 LinearStatePool 和 restore/snapshot。目标是说清楚每一页/槽是谁拥有、何时能驱逐、为何必须在特定 stream 上复制。
+## 22.2 术语对照
+|术语|本书中的准确含义|容易混淆的对象|
+|route|一个 token 对一个专家的选择与权重|唯一专家集合|
+|expert id|某一层内的逻辑专家编号|GPU slot id、token id|
+|bank|专家某类权重/scale 的组织存储|KV page|
+|pool/slot|兼容专家布局的一组物理槽及其中一行|模型的一层或一个 token|
+|fill/fetch|把缺失专家权重复制进 GPU|CPU 原地执行 miss|
+|prefill|处理未计算的提示位置，可能切块|模型训练、一次只输出一个用户词|
+|decode|通常每请求处理一个新输入位置|只执行 LM head|
+|prefix cache|精确 token 前缀对应状态复用|完整答案缓存、语义检索|
+|anchor|适合恢复的结构边界状态快照|相似句子共用状态|
+|CUDA Graph|稳定地址/依赖上的设备操作回放|写死每一步路由结果|
+|overlap|有明确依赖的工作在时间上重叠|取消所有同步或所有阶段混批|
+## 22.3 主要依据与范围
+主要源码是 [FreeToken 官方固定提交](https://github.com/FlashML-org/FreeToken/tree/e4f69d9e232448fc168389c29f6f9364869cff35)。本书采集了 python/freetoken、tests、docs、benchmarks 中符合采集条件的文件和根目录必要文件，共 777 个，逐文件核对 Git blob 身份，并保存 SHA256。网页只生成直接引用及必要文档的源码阅读页；完整已采集文件在 _source 下。它不是完整可安装克隆，更没有把外部依赖源码都包含进来。
+官方设计论文可见 [FreeToken 论文](https://arxiv.org/abs/2608.16157)。阅读论文适合建立设计动机，核对本提交则以函数为准。例如本书明确说明普通缓存委托 flashlib、按布局分 pool、动态 fetch 可能为 0、并发带宽优先，以及整层 prefill 暂存等具体实现条件。没有将论文图表当作本机复现结果。
+叙事组织参考用户指定的 [MiniMind 第 1 章：LLM 全景与项目导览](https://tutorial.baimuyuan.online/minimind-tutorial/chapters/01-LLM%E5%85%A8%E6%99%AF%E4%B8%8E%E9%A1%B9%E7%9B%AE%E5%AF%BC%E8%A7%88)。本书采用从问题、代码地图到逐步实战的阅读组织，正文、例子和 SVG 另行编写，不复制其对 MiniMind 训练流程的叙述，也不把训练教程的结论移植到推理引擎。
+## 22.4 你读完应该能做的事
+用自己的话解释一个请求在哪个进程/对象里，拿到什么数据，改变什么状态，再交给谁；给一次 hybrid 层画 H/F/C 与两条时间线；根据源码指出哪些路径使用整层视图、哪些路径使用 slot；把 KV 与递归快照的恢复条件区分清楚；在 A100 上保存环境、实际 backend 与单变量对照结果。
+如果某项做不到，回到对应章的实验和源码卡，补齐那条数据依赖即可。下一步进入论文工作时，先拿实际 workload 与时间线证明瓶颈，再设计与现有策略的公平对照。架构理解的价值，是知道一条优化会改变哪些账本，以及怎样验证它没有破坏原来的数学与服务语义。
+@check 写一句“FreeToken 的完整架构”应至少包含哪些边界？|入口与协议、tokenize/消息边界、Scheduler/Req/Batch、Engine/模型与采样、专家 host-bank/GPU-cache/CPU-executor、KV/递归状态与前缀缓存、图与 stream、结果提交/停止/取消、运行管理。不是只列一个 PagedAttention 名词。
+@next 回到第一章重新看架构图。此时每个箭头都应能对应具体消息、张量、状态或同步依赖。

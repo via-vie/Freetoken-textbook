@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "source_blobs": 777,
+  "references": 75,
+  "html_pages": 51,
+  "local_links": 18811,
+  "svg": 12,
+  "cpu": {
+    "passed": true,
+    "checks": 8,
+    "engine_executed": false
+  },
+  "hardware_engine_run": false
+}
