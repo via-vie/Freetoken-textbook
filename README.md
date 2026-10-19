@@ -1,6 +1,10 @@
 # FreeToken 推理引擎源码教材
 
-打开 **[index.html](index.html)** 阅读。下载整个目录后，可以直接双击 `index.html`，无需启动服务器、联网加载脚本或安装 GPU 环境。若放到 GitHub，启用 Pages 后在仓库 About 填入实际 Pages 地址；仓库的 Code 页面本身不会渲染教材。
+📖 **[在线阅读完整教材 →](https://via-vie.github.io/Freetoken-textbook/)**
+
+直接在浏览器中阅读，无需下载或安装 GPU 环境。也可以进入 **[第一章](https://via-vie.github.io/Freetoken-textbook/#ch01)**、**[实验与验收指南](https://via-vie.github.io/Freetoken-textbook/#ch20)** 或 **[源码阅读索引](https://via-vie.github.io/Freetoken-textbook/source.html)**。
+
+离线阅读：下载整个目录后，在浏览器中打开本地 `index.html`，无需启动服务器或联网加载脚本。
 
 面向第一次接触 FreeToken 源码的读者，从一条请求串起 MoE 数学、启动与模型加载、调度、专家缓存、CPU/GPU 混合执行、prefill 双缓冲、量化、CUDA Graph、KV 与递归状态、返回与取消、容量重建，以及扩展架构。
 
